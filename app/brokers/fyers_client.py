@@ -240,6 +240,35 @@ class FyersClient(BrokerClient):
             raise BrokerConnectionError(f"Fyers positions error: {resp}")
         return resp.get("netPositions", [])
 
+    def get_basket_margin(self, orders: list[dict]) -> dict:
+        """Ask Fyers for multi-order/SPAN margin before a basket is sent.
+
+        This intentionally uses the same four order payloads that will be
+        submitted.  A caller must treat failures as unavailable, never as a
+        zero-margin approval.
+        """
+        self._require_connected()
+        import requests
+        response = requests.post(
+            "https://api-t1.fyers.in/api/v3/multiorder/margin",
+            headers={"Authorization": f"{self.app_id}:{self.access_token}", "Content-Type": "application/json"},
+            json={"data": orders}, timeout=10,
+        )
+        if not response.ok:
+            raise BrokerConnectionError(f"Fyers margin calculator error: HTTP {response.status_code}")
+        payload = response.json()
+        if payload.get("s") != "ok" or not payload.get("data"):
+            raise BrokerConnectionError(f"Fyers margin calculator error: {payload.get('message', payload)}")
+        return payload["data"]
+
+    def place_basket_orders(self, orders: list[dict]) -> dict:
+        """Place an already-reviewed basket. Never call this for paper mode."""
+        self._require_connected()
+        response = self._fyers.place_basket_orders({"data": orders})
+        if response.get("s") != "ok":
+            raise BrokerConnectionError(f"Fyers basket order rejected: {response.get('message', response)}")
+        return response
+
     # ---------- Historical market data ----------
     def _fetch_candles(self, symbol: str, resolution: str, range_from: date, range_to: date) -> list[PriceBar]:
         self._require_connected()

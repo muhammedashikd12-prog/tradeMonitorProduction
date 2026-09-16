@@ -4,18 +4,24 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NIFTY Iron Condor Live Monitor</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=sl-cards-2">
 </head>
 <body>
   <header class="topbar">
     <div><div class="eyebrow">MANUAL POSITION MONITOR</div><h1>NIFTY IRON CONDOR <span>LIVE MONITOR</span></h1></div>
     <div class="connection-stack"><span class="connection disconnected" id="connection">● DISCONNECTED</span><button class="connect-button" id="connect-fyers">Connect FYERS</button><span class="subtle" id="last-update">Waiting for setup</span></div>
   </header>
+  <nav class="primary-tabs" aria-label="Trading sections">
+    <button class="primary-tab active" type="button" data-tab="LIVE">LIVE TRADING</button>
+    <button class="primary-tab" type="button" data-tab="PAPER">PAPER TRADING</button>
+    <button class="primary-tab" type="button" data-tab="HISTORY">TRADING HISTORY</button>
+  </nav>
   <main>
+    <div id="trading-workspace">
     <section class="setup panel">
-      <div class="section-heading"><div><span class="eyebrow">01 / POSITION</span><h2>Enter your four legs</h2></div><button class="text-button" id="clear-position">Clear position</button></div>
+      <div class="section-heading"><div><span class="eyebrow" id="workspace-eyebrow">01 / LIVE POSITION</span><h2 id="workspace-heading">Enter your four legs</h2></div><div class="inline-actions"><button class="text-button" id="close-position" type="button">Close position</button><button class="text-button" id="clear-position" type="button">Clear position</button></div></div>
       <form id="setup-form">
-        <div class="setup-meta"><label>Expiry <select id="expiry" required><option value="">Loading expiries...</option></select></label><label>Call side SL <input id="call-sl" type="number" min="0" step="0.01" placeholder="Optional ₹"></label><label>Put side SL <input id="put-sl" type="number" min="0" step="0.01" placeholder="Optional ₹"></label></div>
+        <div class="setup-meta"><label>Expiry <select id="expiry" required><option value="">Loading expiries...</option></select></label><input id="mode-select" value="LIVE" type="hidden"><label class="paper-setting">Paper slippage <input id="slippage-points" type="number" min="0" max="2" step="0.01" value="0.05" placeholder="₹ pts"></label><div class="calculated-sl"><span>CALL SIDE SL</span><strong id="call-sl">—</strong><small>3× Max Profit</small></div><div class="calculated-sl"><span>PUT SIDE SL</span><strong id="put-sl">—</strong><small>3× Max Profit</small></div></div>
         <div class="leg-grid">
           <fieldset class="leg-card buy"><legend>CALL BUY <small>HEDGE</small></legend><input data-leg="CALL BUY" data-field="symbol" placeholder="Fyers symbol" readonly required><div class="compact-inputs"><select data-leg="CALL BUY" data-field="strike" data-option-type="CE" required><option value="">Loading option chain...</option></select><input data-leg="CALL BUY" data-field="quantity" type="number" min="1" placeholder="Qty" required><input data-leg="CALL BUY" data-field="entry_price" type="number" min="0" step="0.05" placeholder="Entry ₹" required></div></fieldset>
           <fieldset class="leg-card sell"><legend>CALL SELL <small>SHORT</small></legend><input data-leg="CALL SELL" data-field="symbol" placeholder="Fyers symbol" readonly required><div class="compact-inputs"><select data-leg="CALL SELL" data-field="strike" data-option-type="CE" required><option value="">Loading option chain...</option></select><input data-leg="CALL SELL" data-field="quantity" type="number" min="1" placeholder="Qty" required><input data-leg="CALL SELL" data-field="entry_price" type="number" min="0" step="0.05" placeholder="Entry ₹" required></div></fieldset>
@@ -24,6 +30,13 @@
         </div>
         <div class="setup-actions"><span class="form-message" id="form-message"></span><button class="button primary" type="submit">Save position &amp; monitor</button></div>
       </form>
+      <section class="sl-preview" aria-live="polite">
+        <div class="sl-preview-heading"><div><span class="eyebrow">RISK &amp; SL PREVIEW</span><h2>ADVANCE STOP-LOSS LEVELS</h2></div><div class="sl-spot"><span>Based on NIFTY SPOT</span><strong id="sl-preview-spot">—</strong><small id="sl-preview-status">Enter all four legs</small></div></div>
+        <div class="sl-preview-grid">
+          <article class="sl-card call" id="sl-card-call"><div class="sl-card-heading"><strong>CALL SPREAD</strong><span class="sl-side-label">CALL</span></div><div class="sl-trigger"><span>🎯 SL TRIGGER</span><strong id="preview-call-trigger">—</strong></div><div class="sl-distance"><div><span>DISTANCE TO SL</span><strong id="preview-call-distance">—</strong></div><div class="sl-gauge"><i id="preview-call-gauge"></i><b></b></div><div class="sl-gauge-labels"><span>NIFTY <b id="preview-call-spot">—</b></span><span>SL <b id="preview-call-gauge-trigger">—</b></span></div></div><div class="sl-metrics"><div><span>NET CREDIT</span><b id="preview-call-credit">—</b></div><div><span>MAX PROFIT</span><b id="preview-call-profit">—</b></div><div><span>SL LOSS</span><b id="preview-call-loss">—</b><small>3× Max Profit</small></div><div><span>SL MULTIPLIER</span><b>3×</b></div></div><div class="sl-legs"><div class="sl-legs-heading"><span>LEG</span><span>ENTRY</span></div><div><span>CALL SELL</span><b id="preview-call-sell-entry">—</b></div><div><span>CALL BUY</span><b id="preview-call-buy-entry">—</b></div></div><div class="sl-status safe" id="preview-call-status"><i>●</i><span>SAFE</span></div></article>
+          <article class="sl-card put" id="sl-card-put"><div class="sl-card-heading"><strong>PUT SPREAD</strong><span class="sl-side-label">PUT</span></div><div class="sl-trigger"><span>🎯 SL TRIGGER</span><strong id="preview-put-trigger">—</strong></div><div class="sl-distance"><div><span>DISTANCE TO SL</span><strong id="preview-put-distance">—</strong></div><div class="sl-gauge"><i id="preview-put-gauge"></i><b></b></div><div class="sl-gauge-labels"><span>NIFTY <b id="preview-put-spot">—</b></span><span>SL <b id="preview-put-gauge-trigger">—</b></span></div></div><div class="sl-metrics"><div><span>NET CREDIT</span><b id="preview-put-credit">—</b></div><div><span>MAX PROFIT</span><b id="preview-put-profit">—</b></div><div><span>SL LOSS</span><b id="preview-put-loss">—</b><small>3× Max Profit</small></div><div><span>SL MULTIPLIER</span><b>3×</b></div></div><div class="sl-legs"><div class="sl-legs-heading"><span>LEG</span><span>ENTRY</span></div><div><span>PUT SELL</span><b id="preview-put-sell-entry">—</b></div><div><span>PUT BUY</span><b id="preview-put-buy-entry">—</b></div></div><div class="sl-status safe" id="preview-put-status"><i>●</i><span>SAFE</span></div></article>
+        </div>
+      </section>
     </section>
     <section class="market-strip panel"><div><span>NIFTY SPOT</span><strong id="spot">—</strong></div><div><span>NIFTY CHANGE</span><strong id="spot-change">—</strong></div><div><span>EXPIRY</span><strong id="expiry-label">—</strong></div><div><span>TIME REMAINING</span><strong id="time-left">—</strong></div></section>
     <section class="hero panel"><span class="eyebrow">TOTAL POSITION P&amp;L</span><strong id="total-pnl">—</strong><div class="hero-foot"><span>Today's P&amp;L</span><span id="today-pnl">—</span></div></section>
@@ -37,6 +50,12 @@
       <div class="panel card-padding"><span class="eyebrow">MANUAL RISK</span><h2>Alert-only stops</h2><div class="iv-row"><span>Call SL / current</span><strong id="call-sl-status">—</strong></div><div class="iv-row"><span>Put SL / current</span><strong id="put-sl-status">—</strong></div><p class="subtle note">No exit orders are placed by this monitor.</p></div>
       <div class="panel card-padding"><span class="eyebrow">ALERTS</span><h2>What needs attention</h2><ul class="alerts" id="alerts"><li class="subtle">No alerts.</li></ul></div>
     </section>
+    <section class="two-column">
+      <div class="panel card-padding"><div class="section-heading compact-heading"><div><span class="eyebrow">04 / FUND</span><h2>Fund requirement</h2></div><span class="subtle" id="fund-mode-tag">MARKET</span></div><div class="metric-list tiny"><div><span>Gross hedge requirement</span><strong id="gross-hedge">—</strong></div><div><span>Short-leg proceeds</span><strong id="short-proceeds">—</strong></div><div><span>Net initial cash</span><strong id="net-cash">—</strong></div><div><span>Charges</span><strong id="fund-charges">—</strong></div><div><span>Final estimated funds</span><strong id="final-funds">—</strong></div></div></div>
+    </section>
+    </div>
+    <section class="panel card-padding history-tab" id="history-panel"><div class="section-heading compact-heading"><div><span class="eyebrow">TRADING HISTORY</span><h2>Live and paper positions</h2></div><span class="subtle">Stored locally and retained after clearing</span></div><div class="history-list" id="history-list"><div class="subtle">No prior positions yet.</div></div></section>
+    <dialog class="delete-history-dialog" id="delete-history-dialog"><form method="dialog"><span class="eyebrow">DELETE HISTORY</span><h2>Delete trading history?</h2><p id="delete-history-message">Are you sure you want to delete this trading history? This action cannot be undone.</p><p class="subtle">Deleting an OPEN record does not close or exit the actual position.</p><div class="dialog-actions"><button class="text-button" value="cancel" id="cancel-delete-history" type="button">Cancel</button><button class="button danger" value="confirm" id="confirm-delete-history" type="button">Delete</button></div></form></dialog>
   </main>
   <footer>Manual input · FYERS live data · P&amp;L and risk visibility · no automatic trades</footer>
   <script src="app.js"></script>

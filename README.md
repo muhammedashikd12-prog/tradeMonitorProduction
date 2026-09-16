@@ -44,16 +44,20 @@ frontend/
   index.html / styles.css / app.js   Dark trading-terminal dashboard (no build step)
 ```
 
-## Setup — backend
+## Setup - backend
 
-On Windows, double-click `start_server.bat` to start the backend and open the dashboard.
+On Windows, double-click `start_server.bat` to start the backend and open the dashboard on the PC.
 Install dependencies first with `pip install -r requirements.txt` if this is a fresh checkout.
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env   # fill in your Fyers app_id / secret / redirect_uri, and NIFTY_LOT_SIZE
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+The server listens on port 8000 on the local network. The frontend uses the same
+host that served the dashboard, so localhost continues to work on the PC and a
+phone can use the PC's IPv4 address without changing frontend configuration.
 
 You still need to complete the Fyers OAuth login flow once (see
 `brokers/fyers_client.py::generate_login_url` /
@@ -62,15 +66,54 @@ this cannot be done headlessly since Fyers requires an interactive browser
 login redirect. Hit `GET /fyers/login-url`, open it, log in, then hit
 `GET /fyers/callback?auth_code=...` with the code from the redirect URL.
 
-## Setup — frontend
+## Setup - frontend
 
 No npm/build step is required. The FastAPI backend serves the frontend, so
-start only the backend and open `http://127.0.0.1:8000` in a browser. Enter the expiry and
+start only the backend and open `http://127.0.0.1:8000` in a browser on the PC. Enter the expiry and
 the four broker symbols, strikes, quantities, and entry prices. The monitor
 refreshes live quote data automatically and never sends exit orders.
 
 Manual monitor endpoints are `POST /manual-monitor/setup`,
 `GET /manual-monitor`, and `DELETE /manual-monitor/setup`.
+
+## How to open my trading dashboard on my phone
+
+1. Make sure the PC and phone are connected to the same Wi-Fi network.
+2. On the PC, double-click `start_server.bat`. Keep the command window open.
+3. In PowerShell, find the PC's local IPv4 address:
+
+  ```powershell
+  ipconfig
+  ```
+
+  Find the `IPv4 Address` under the Wi-Fi adapter, for example `192.168.1.10`.
+4. On the phone, open this address in a browser, replacing the example IP with
+  the PC's address:
+
+  ```text
+  http://192.168.1.10:8000
+  ```
+
+5. To check reachability from the PC, open:
+
+  ```text
+  http://127.0.0.1:8000/health
+  ```
+
+  A healthy server returns `{"status":"ok"}`.
+
+If Windows Firewall blocks the connection, allow only inbound TCP port 8000 on
+Private networks from an elevated PowerShell window:
+
+```powershell
+New-NetFirewallRule -DisplayName "Condor AI FastAPI (Private)" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow -Profile Private
+```
+
+Do not use this rule on Public networks. Remove it later with:
+
+```powershell
+Remove-NetFirewallRule -DisplayName "Condor AI FastAPI (Private)"
+```
 
 Screens: **Dashboard** (AI score gauge, decision, 4-leg structure, reasoning/
 risks/invalidation — click Analyze, or enable 30s auto-refresh), **Option
