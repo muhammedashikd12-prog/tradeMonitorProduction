@@ -123,6 +123,12 @@ sudo systemctl restart tradeMonitor
 sudo systemctl status tradeMonitor
 ```
 
+View service logs with:
+
+```bash
+journalctl -u tradeMonitor
+```
+
 After future pushes, deploy with:
 
 ```bash

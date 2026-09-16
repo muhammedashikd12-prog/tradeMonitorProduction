@@ -4,10 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/tradeMonitor
-EnvironmentFile=/home/ubuntu/tradeMonitor/.env
-ExecStart=/home/ubuntu/tradeMonitor/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+User=ec2-user
+WorkingDirectory=/home/ec2-user/tradeMonitor
+EnvironmentFile=/home/ec2-user/tradeMonitor/.env
+ExecStart=/home/ec2-user/tradeMonitor/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5
 
