@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     # --- Fyers ---
     fyers_app_id: str = ""
     fyers_secret_id: str = ""
-    fyers_redirect_uri: str = "https://127.0.0.1:8000/fyers/callback"
+    fyers_redirect_uri: str = ""
     fyers_access_token: str = ""
 
     # --- Capital / risk ---

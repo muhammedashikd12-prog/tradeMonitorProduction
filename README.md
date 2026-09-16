@@ -44,7 +44,7 @@ frontend/
   index.html / styles.css / app.js   Dark trading-terminal dashboard (no build step)
 ```
 
-## Setup - backend
+## Setup - local backend
 
 On Windows, double-click `start_server.bat` to start the backend and open the dashboard on the PC.
 Install dependencies first with `pip install -r requirements.txt` if this is a fresh checkout.
@@ -52,12 +52,11 @@ Install dependencies first with `pip install -r requirements.txt` if this is a f
 ```bash
 pip install -r requirements.txt
 cp .env.example .env   # fill in your Fyers app_id / secret / redirect_uri, and NIFTY_LOT_SIZE
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-The server listens on port 8000 on the local network. The frontend uses the same
-host that served the dashboard, so localhost continues to work on the PC and a
-phone can use the PC's IPv4 address without changing frontend configuration.
+The local server listens only on the PC. Set `FYERS_REDIRECT_URI` in the local
+`.env` to `http://127.0.0.1:8000/fyers/callback`.
 
 You still need to complete the Fyers OAuth login flow once (see
 `brokers/fyers_client.py::generate_login_url` /
@@ -75,6 +74,65 @@ refreshes live quote data automatically and never sends exit orders.
 
 Manual monitor endpoints are `POST /manual-monitor/setup`,
 `GET /manual-monitor`, and `DELETE /manual-monitor/setup`.
+
+## Production deployment on AWS EC2
+
+The deployment repository is `tradeMonitorProduction`. The original source
+repository is kept separate. On EC2, clone the deployment repository into
+`~/tradeMonitor` and create an EC2-only `.env` from `.env.example`.
+
+```bash
+cd ~
+git clone https://github.com/muhammedashikd12-prog/tradeMonitorProduction.git tradeMonitor
+cd ~/tradeMonitor
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+chmod 600 .env
+```
+
+Set the production-only callback URL in the EC2 `.env`:
+
+```env
+FYERS_REDIRECT_URI=http://13.233.131.142:8000/fyers/callback
+```
+
+Do not commit that file. Keep credentials and access tokens only in the EC2
+`.env` file or in a future secrets manager.
+
+### Manual update
+
+```bash
+cd ~/tradeMonitor
+git pull --ff-only origin main
+source .venv/bin/activate
+pkill -f "uvicorn app.main:app" || true
+nohup .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 > app.log 2>&1 &
+```
+
+### Recommended systemd service
+
+The repository includes `deploy/tradeMonitor.service`. Install it on EC2 as
+`/etc/systemd/system/tradeMonitor.service`, then run:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now tradeMonitor
+sudo systemctl restart tradeMonitor
+sudo systemctl status tradeMonitor
+```
+
+After future pushes, deploy with:
+
+```bash
+cd ~/tradeMonitor
+git pull --ff-only origin main
+sudo systemctl restart tradeMonitor
+curl http://127.0.0.1:8000/health
+```
+
+The EC2 security group must allow TCP port 8000 from the intended network.
 
 ## How to open my trading dashboard on my phone
 
@@ -114,6 +172,23 @@ Do not use this rule on Public networks. Remove it later with:
 ```powershell
 Remove-NetFirewallRule -DisplayName "Condor AI FastAPI (Private)"
 ```
+
+## Git workflow
+
+`main` is the stable production branch. Optional feature branches are short-
+lived and must be tested before merging into `main`:
+
+```powershell
+git checkout -b feature/<feature-name>
+# develop and test locally at http://127.0.0.1:8000
+git add .
+git commit -m "Describe the change"
+git checkout main
+git merge feature/<feature-name>
+git push origin main
+```
+
+Then update EC2 with `git pull --ff-only origin main` and restart the service.
 
 Screens: **Dashboard** (AI score gauge, decision, 4-leg structure, reasoning/
 risks/invalidation — click Analyze, or enable 30s auto-refresh), **Option
