@@ -3,6 +3,7 @@ a WebSocket broadcast for the frontend dashboard."""
 from __future__ import annotations
 import asyncio
 import json
+from types import SimpleNamespace
 from pathlib import Path
 from datetime import datetime, date, time as date_time
 from typing import Literal
@@ -25,6 +26,7 @@ from app.services import market_data_service
 from app.services.iron_condor_calculations import (
     calculate_position, calculate_fund_requirement, calculate_paper_execution_price,
     calculate_position_charges, calculate_advance_sl, advance_sl_state,
+    calculate_position_charge_breakdown,
 )
 
 app = FastAPI(title="Condor AI")
@@ -43,6 +45,7 @@ broker = FyersClient(
     secret_id=settings.fyers_secret_id,
     redirect_uri=settings.fyers_redirect_uri,
     access_token=settings.fyers_access_token,
+    token_file=settings.fyers_token_file,
 )
 exec_engine = execution_engine.ExecutionEngine(broker, symbol_prefix="NSE:NIFTY")
 
@@ -130,23 +133,37 @@ def broadcast_sync(payload: dict) -> None:
 # ---------------- Auth ----------------
 @app.get("/fyers/login-url")
 def fyers_login_url():
-    return {"url": broker.generate_login_url()}
+    try:
+        return {"url": broker.generate_login_url()}
+    except BrokerConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 @app.get("/fyers/callback")
-def fyers_callback(auth_code: str):
+def fyers_callback(auth_code: str | None = None, error: str | None = None):
+    if error or not auth_code:
+        return RedirectResponse(url="/?fyers=failed")
     try:
-        token = broker.exchange_auth_code(auth_code)
+        broker.exchange_auth_code(auth_code)
+        if not broker.verify_connection():
+            return RedirectResponse(url="/?fyers=failed")
     except BrokerConnectionError:
-        return RedirectResponse(url="/?connected=0")
-    return RedirectResponse(url="/?connected=1" if token else "/?connected=0")
+        return RedirectResponse(url="/?fyers=failed")
+    return RedirectResponse(url="/?fyers=connected")
+
+
+@app.get("/fyers/status")
+def fyers_status():
+    return broker.auth_status()
 
 
 # ---------------- Status ----------------
 @app.get("/status")
 def status():
+    auth = broker.auth_status()
     return {
-        "broker_status": broker.connection_status(),
+        "broker_status": broker.connection_status() if auth["connected"] else auth["state"],
+        "fyers": auth,
         "operating_mode": settings.operating_mode,
         "execution_mode": settings.execution_mode,
     }
@@ -240,7 +257,20 @@ def manual_history():
     db = SessionLocal()
     rows = db.query(PositionHistoryEntry).order_by(PositionHistoryEntry.created_at.desc()).all()
     db.close()
-    return [_coerce_history_entry(row) for row in rows]
+    quote_map: dict[str, dict] = {}
+    open_symbols = {
+        leg.get("symbol")
+        for row in rows
+        if row.status == "OPEN"
+        for leg in (json.loads(row.legs_json or "[]") if row.legs_json else [])
+        if leg.get("symbol")
+    }
+    if open_symbols and broker.is_connected():
+        try:
+            quote_map = broker.get_quotes(sorted(open_symbols))
+        except BrokerConnectionError:
+            quote_map = {}
+    return [_coerce_history_entry(row, quote_map) for row in rows]
 
 
 @app.delete("/manual-monitor/history/{position_id}")
@@ -268,6 +298,21 @@ def _quote_value(quote: dict, *keys: str):
         if quote.get(key) is not None:
             return quote[key]
     return None
+
+
+def _pnl_percentage(pnl: float | None, entry_price: float | None, quantity: int | None = None) -> float | None:
+    if pnl is None or entry_price is None or entry_price == 0:
+        return None
+    return (pnl / (abs(float(entry_price)) * max(1, int(quantity or 1)))) * 100
+
+
+def _charge_payload(breakdown: dict[str, float]) -> dict:
+    labels = {
+        "brokerage": "Brokerage", "stt": "STT", "exchange_transaction": "Exchange Transaction Charges",
+        "gst": "GST", "sebi": "SEBI Charges", "stamp_duty": "Stamp Duty", "other": "Other Applicable Charges",
+    }
+    return {"breakdown": [{"key": key, "label": labels[key], "amount": value} for key, value in breakdown.items()],
+            "total": sum(breakdown.values())}
 
 
 def _advance_sl_payload(legs: dict[str, ManualLeg], spot: float | None = None) -> dict:
@@ -385,8 +430,31 @@ def place_live_basket(payload: BasketPlacement):
     return {"placed": True, "basket_response": response, "monitor": saved}
 
 
-def _coerce_history_entry(row: PositionHistoryEntry) -> dict:
+def _coerce_history_entry(row: PositionHistoryEntry, quote_map: dict[str, dict] | None = None) -> dict:
     legs = json.loads(row.legs_json or "[]") if row.legs_json else []
+    quote_map = quote_map or {}
+    marks: dict[str, float | None] = {}
+    for leg in legs:
+        mark = (_quote_value(quote_map.get(leg.get("symbol"), {}), "lp") if row.status == "OPEN"
+                else leg.get("exit_price"))
+        marks[leg.get("leg", "")] = mark
+        leg["current_ltp"] = mark
+        direction = 1 if "BUY" in leg.get("leg", "") else -1
+        leg_pnl = ((mark - leg["entry_price"]) * leg["quantity"] * direction
+                   if mark is not None and leg.get("entry_price") is not None else None)
+        leg["pnl"] = leg_pnl
+        leg["pnl_pct"] = _pnl_percentage(leg_pnl, leg.get("entry_price"), leg.get("quantity"))
+    complete_pnl = all(leg.get("pnl") is not None for leg in legs)
+    calculated_gross_pnl = sum(leg["pnl"] for leg in legs) if complete_pnl else None
+    if row.status != "OPEN" and row.charge_breakdown_json:
+        charge_breakdown = json.loads(row.charge_breakdown_json)
+    else:
+        charge_legs = {leg.get("leg"): SimpleNamespace(entry_price=leg.get("entry_price"), quantity=leg.get("quantity")) for leg in legs}
+        charge_breakdown = calculate_position_charge_breakdown(charge_legs, marks)
+    total_entry_value = sum((leg.get("entry_price") or 0) * (leg.get("quantity") or 0) for leg in legs)
+    gross_pnl = (row.realized_pnl if row.status != "OPEN" and row.realized_pnl is not None else calculated_gross_pnl)
+    net_pnl = (row.net_pnl if row.status != "OPEN" and row.net_pnl is not None
+               else gross_pnl - sum(charge_breakdown.values()) if gross_pnl is not None else None)
     return {
         "id": row.id,
         "position_id": row.position_id,
@@ -422,8 +490,12 @@ def _coerce_history_entry(row: PositionHistoryEntry) -> dict:
         "opened_at": row.opened_at.isoformat() if row.opened_at else None,
         "closed_at": row.closed_at.isoformat() if row.closed_at else None,
         "realized_pnl": row.realized_pnl,
-        "charges": row.charges,
-        "net_pnl": row.net_pnl,
+        "charges": sum(charge_breakdown.values()),
+        "charge_breakdown": _charge_payload(charge_breakdown),
+        "net_pnl": net_pnl,
+        "net_pnl_pct": _pnl_percentage(net_pnl, total_entry_value, 1),
+        "gross_pnl": gross_pnl,
+        "live_pnl": gross_pnl if row.status == "OPEN" else None,
         "reason_for_closing": row.reason_for_closing,
         "legs": legs,
     }
@@ -475,6 +547,7 @@ def _persist_manual_position_entry(setup: ManualMonitorSetup, live_ltp_map: dict
             opened_at=datetime.utcnow(),
             realized_pnl=0.0,
             charges=calculate_position_charges(by_name),
+            charge_breakdown_json=json.dumps(calculate_position_charge_breakdown(by_name)),
             net_pnl=-calculate_position_charges(by_name),
             reason_for_closing=None,
             legs_json=json.dumps([
@@ -531,6 +604,7 @@ def _close_active_history(reason: str, status: str = "STOPPED", final_spot: floa
         # Closing charges are added only once the final executable prices are
         # available; open rows show entry charges only.
         row.charges = calculate_position_charges(by_name, complete_ltps or None)
+        row.charge_breakdown_json = json.dumps(calculate_position_charge_breakdown(by_name, complete_ltps or None))
         row.realized_pnl = calculations["total_pnl"] if len(complete_ltps) == 4 else row.realized_pnl
         row.net_pnl = (row.realized_pnl or 0.0) - (row.charges or 0.0)
         db.commit()
@@ -568,6 +642,13 @@ def _manual_snapshot() -> dict:
     advance = calculate_advance_sl(by_name)
     for leg in live_legs:
         leg["pnl"] = calculations["pnl"][leg["leg"]]
+        leg["pnl_pct"] = _pnl_percentage(leg["pnl"], leg["entry_price"], leg["quantity"])
+    charge_breakdown = calculate_position_charge_breakdown(by_name, live_ltps)
+    total_charges = sum(charge_breakdown.values())
+    total_entry_value = sum(leg.entry_price * leg.quantity for leg in _manual_monitor.legs)
+    complete_position = all(price is not None for price in live_ltps.values())
+    gross_pnl = calculations["total_pnl"] if complete_position else None
+    net_pnl = gross_pnl - total_charges if gross_pnl is not None else None
     # Once an active trade is entered, its entry prices (including paper
     # simulated fills) are fixed.  Do not re-simulate them on every tick.
     # Entry prices are fixed at setup (paper prices already include one
@@ -649,9 +730,10 @@ def _manual_snapshot() -> dict:
                 row.entry_nifty_spot = row.entry_nifty_spot if row.entry_nifty_spot is not None else spot
                 row.final_nifty_spot = spot
                 row.updated_at = datetime.utcnow()
-                row.charges = calculate_position_charges(by_name)
-                row.realized_pnl = calculations["total_pnl"]
-                row.net_pnl = calculations["total_pnl"] - row.charges
+                row.charges = total_charges
+                row.charge_breakdown_json = json.dumps(charge_breakdown)
+                row.realized_pnl = gross_pnl
+                row.net_pnl = net_pnl
                 row.mode = _manual_monitor.mode
                 row.call_sl_state = call_state
                 row.put_sl_state = put_state
@@ -672,7 +754,10 @@ def _manual_snapshot() -> dict:
             db.close()
     return {"configured": True, "connection": broker.connection_status() if connected else "DISCONNECTED", "expiry": _manual_monitor.expiry.isoformat(),
             "spot": spot, "spot_change": spot_change, "spot_change_pct": spot_change_pct,
-            "mode": _manual_monitor.mode, "position_status": "OPEN", "legs": live_legs, "total_pnl": calculations["total_pnl"],
+            "mode": _manual_monitor.mode, "position_status": "OPEN", "legs": live_legs, "total_pnl": gross_pnl,
+            "total_gross_pnl": gross_pnl, "total_charges": total_charges,
+            "charges": _charge_payload(charge_breakdown), "net_pnl": net_pnl,
+            "net_pnl_pct": _pnl_percentage(net_pnl, total_entry_value, 1),
             "call_spread_pnl": calculations["call_spread_pnl"], "put_spread_pnl": calculations["put_spread_pnl"],
             "call_credit": calculations["call_credit"]["total"], "put_credit": calculations["put_credit"]["total"],
             "call_credit_per_unit": calculations["call_credit"]["per_unit"], "put_credit_per_unit": calculations["put_credit"]["per_unit"],

@@ -86,6 +86,7 @@ class PositionHistoryEntry(Base):
     closed_at = Column(DateTime, nullable=True)
     realized_pnl = Column(Float, nullable=True)
     charges = Column(Float, nullable=True)
+    charge_breakdown_json = Column(Text, nullable=True)
     net_pnl = Column(Float, nullable=True)
     reason_for_closing = Column(Text, nullable=True)
     legs_json = Column(Text, nullable=True)

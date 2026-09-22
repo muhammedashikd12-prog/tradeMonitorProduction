@@ -1,7 +1,10 @@
 import unittest
 from types import SimpleNamespace
 
-from app.services.iron_condor_calculations import calculate_position, calculate_advance_sl, advance_sl_state
+from app.services.iron_condor_calculations import (
+    calculate_position, calculate_advance_sl, advance_sl_state,
+    calculate_position_charge_breakdown, calculate_position_charges,
+)
 
 
 def _legs():
@@ -54,3 +57,12 @@ class IronCondorCalculationTests(unittest.TestCase):
         state, triggered = advance_sl_state(-450, 450, 22018, 22018, "CALL")
         self.assertEqual((state, triggered), ("SL_TRIGGERED", True))
         self.assertEqual(advance_sl_state(-500, 450, 22020, 22018, "CALL", state), ("SL_TRIGGERED", False))
+
+    def test_charge_breakdown_preserves_existing_total(self):
+        breakdown = calculate_position_charge_breakdown(_legs(), {
+            "CALL BUY": 6, "CALL SELL": 14, "PUT SELL": 8, "PUT BUY": 3,
+        })
+        self.assertEqual(set(breakdown), {"brokerage", "stt", "exchange_transaction", "gst", "sebi", "stamp_duty", "other"})
+        self.assertAlmostEqual(sum(breakdown.values()), calculate_position_charges(_legs(), {
+            "CALL BUY": 6, "CALL SELL": 14, "PUT SELL": 8, "PUT BUY": 3,
+        }))

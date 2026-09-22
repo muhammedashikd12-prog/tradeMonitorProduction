@@ -4,6 +4,8 @@
 *.db
 *.db-journal
 *.log
+local/fyers_token.json
+local/fyers_token.json.tmp
 .venv/
 __pycache__/
 *.py[cod]

@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     fyers_secret_id: str = ""
     fyers_redirect_uri: str = ""
     fyers_access_token: str = ""
+    fyers_token_file: str = "local/fyers_token.json"
 
     # --- Capital / risk ---
     total_capital: float = 80_000

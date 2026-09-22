@@ -58,12 +58,12 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 The local server listens only on the PC. Set `FYERS_REDIRECT_URI` in the local
 `.env` to `http://127.0.0.1:8000/fyers/callback`.
 
-You still need to complete the Fyers OAuth login flow once (see
-`brokers/fyers_client.py::generate_login_url` /
-`brokers/fyers_client.py::exchange_auth_code`) to obtain an access token —
-this cannot be done headlessly since Fyers requires an interactive browser
-login redirect. Hit `GET /fyers/login-url`, open it, log in, then hit
-`GET /fyers/callback?auth_code=...` with the code from the redirect URL.
+Complete the Fyers OAuth login from the dashboard's **Connect FYERS** button.
+The server generates the login URL, receives `/fyers/callback`, exchanges the
+one-time authorization code, verifies the new token with a Fyers API request,
+and stores it in the private `FYERS_TOKEN_FILE`. Access tokens expire, so use
+the same button again whenever `GET /fyers/status` reports authentication is
+required or failed. The token is never returned to the browser.
 
 ## Setup - frontend
 
@@ -95,7 +95,7 @@ chmod 600 .env
 Set the production-only callback URL in the EC2 `.env`:
 
 ```env
-FYERS_REDIRECT_URI=http://13.233.131.142:8000/fyers/callback
+FYERS_REDIRECT_URI=http://YOUR_EC2_HOST_OR_DOMAIN:8000/fyers/callback
 ```
 
 Do not commit that file. Keep credentials and access tokens only in the EC2

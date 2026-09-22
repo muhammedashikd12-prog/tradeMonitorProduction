@@ -75,6 +75,11 @@ def advance_sl_state(current_pnl: float | None, sl_loss: float | None, spot: flo
 
 def calculate_fyers_leg_charges(price: float, quantity: int, side: str) -> float:
     """Estimate Fyers-equivalent option charges using real option-execution logic."""
+    return sum(calculate_fyers_charge_breakdown(price, quantity, side).values())
+
+
+def calculate_fyers_charge_breakdown(price: float, quantity: int, side: str) -> dict[str, float]:
+    """Return the existing Fyers-equivalent charge model by charge type."""
     qty = max(0, int(quantity))
     turnover = max(0.0, float(price) * qty)
     brokerage = 0.0
@@ -84,7 +89,15 @@ def calculate_fyers_leg_charges(price: float, quantity: int, side: str) -> float
     stamp = turnover * 0.00003 if side == "BUY" else 0.0
     stt = turnover * 0.0001 if side == "SELL" else 0.0
     gst = (brokerage + exchange_txn + clearing + sebi + stamp + stt) * 0.18
-    return brokerage + exchange_txn + clearing + sebi + stamp + stt + gst
+    return {
+        "brokerage": brokerage,
+        "stt": stt,
+        "exchange_transaction": exchange_txn,
+        "gst": gst,
+        "sebi": sebi,
+        "stamp_duty": stamp,
+        "other": clearing,
+    }
 
 
 def calculate_paper_execution_price(leg: Any, quote: dict | None, slippage_points: float = 0.05) -> float:
@@ -109,13 +122,20 @@ def calculate_position_charges(legs: dict[str, Any], exit_ltps: dict[str, float 
     A long option is sold to close and a short option is bought to close.
     This deliberately keeps the transaction-side tax treatment in one place.
     """
-    total = 0.0
+    return sum(calculate_position_charge_breakdown(legs, exit_ltps).values())
+
+
+def calculate_position_charge_breakdown(legs: dict[str, Any], exit_ltps: dict[str, float | None] | None = None) -> dict[str, float]:
+    """Aggregate opening and optional closing charges without changing the model."""
+    total = {key: 0.0 for key in ("brokerage", "stt", "exchange_transaction", "gst", "sebi", "stamp_duty", "other")}
     for name, leg in legs.items():
         entry_side = "BUY" if "BUY" in name else "SELL"
-        total += calculate_fyers_leg_charges(leg.entry_price, leg.quantity, entry_side)
+        for key, value in calculate_fyers_charge_breakdown(leg.entry_price, leg.quantity, entry_side).items():
+            total[key] += value
         if exit_ltps and exit_ltps.get(name) is not None:
             exit_side = "SELL" if entry_side == "BUY" else "BUY"
-            total += calculate_fyers_leg_charges(float(exit_ltps[name]), leg.quantity, exit_side)
+            for key, value in calculate_fyers_charge_breakdown(float(exit_ltps[name]), leg.quantity, exit_side).items():
+                total[key] += value
     return total
 
 

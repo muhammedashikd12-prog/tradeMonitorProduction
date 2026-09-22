@@ -14,9 +14,13 @@ Auth flow (one-time, interactive — cannot be done headlessly):
        (Fyers tokens are valid for the trading day).
 """
 from __future__ import annotations
+import json
+import logging
+import os
+from pathlib import Path
 import time
 import threading
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional, Callable
 
 from app.brokers.base import BrokerClient, BrokerConnectionError
@@ -29,14 +33,23 @@ except ImportError:
     fyersModel = None
     data_ws = None
 
+logger = logging.getLogger(__name__)
+
 
 class FyersClient(BrokerClient):
-    def __init__(self, app_id: str, secret_id: str, redirect_uri: str, access_token: str = ""):
+    def __init__(self, app_id: str, secret_id: str, redirect_uri: str,
+                 access_token: str = "", token_file: str = "local/fyers_token.json"):
         self.app_id = app_id
         self.secret_id = secret_id
         self.redirect_uri = redirect_uri
-        self.access_token = access_token
+        self.token_file = Path(token_file)
+        self._token_store_invalidated = False
+        stored_token = self._load_token()
+        self.access_token = stored_token or ("" if self._token_store_invalidated else access_token.strip())
         self._connected = False
+        self._auth_state = "AUTHENTICATION_REQUIRED"
+        self._auth_failure_latched = False
+        self._last_verified: Optional[datetime] = None
         self._last_tick_at: Optional[float] = None
         self._ws = None
         self._ws_lock = threading.Lock()
@@ -53,27 +66,120 @@ class FyersClient(BrokerClient):
         ) if fyersModel else None
 
         self._fyers = None
-        if access_token and fyersModel:
+        if self.access_token and fyersModel:
             self._init_fyers_model()
 
     # ---------- Auth ----------
     def generate_login_url(self) -> str:
+        if not self._session:
+            raise BrokerConnectionError("FYERS SDK is not installed")
         return self._session.generate_authcode()
 
-    def exchange_auth_code(self, auth_code: str) -> str:
+    def exchange_auth_code(self, auth_code: str) -> None:
+        if not auth_code or not auth_code.strip():
+            raise BrokerConnectionError("FYERS authentication failed: missing authorization code")
+        if not self._session:
+            raise BrokerConnectionError("FYERS SDK is not installed")
         self._session.set_token(auth_code)
         response = self._session.generate_token()
         if response.get("s") != "ok" or not response.get("access_token"):
-            raise BrokerConnectionError(f"Fyers authentication failed: {response.get('message', response)}")
-        self.access_token = response["access_token"]
+            logger.warning("FYERS authentication failed: token exchange rejected")
+            raise BrokerConnectionError("FYERS authentication failed: token exchange rejected")
+        self.access_token = str(response["access_token"])
+        self._save_token(self.access_token)
+        self._auth_failure_latched = False
         self._init_fyers_model()
-        return self.access_token
+        logger.info("FYERS authentication successful")
 
     def _init_fyers_model(self):
         self._fyers = fyersModel.FyersModel(
             client_id=self.app_id, is_async=False, token=self.access_token, log_path=""
         )
+        self._connected = False
+
+    def _load_token(self) -> str:
+        try:
+            with self.token_file.open(encoding="utf-8") as token_file:
+                payload = json.load(token_file)
+                if payload.get("invalidated"):
+                    self._token_store_invalidated = True
+                token = payload.get("access_token", "")
+                return str(token).strip()
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            return ""
+
+    def _save_token(self, token: str) -> None:
+        self._write_token_store({"access_token": token})
+
+    def _write_token_store(self, payload: dict) -> None:
+        self.token_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary_file = self.token_file.with_suffix(self.token_file.suffix + ".tmp")
+        with temporary_file.open("w", encoding="utf-8") as token_file:
+            json.dump(payload, token_file)
+        try:
+            os.chmod(temporary_file, 0o600)
+        except OSError:
+            pass
+        temporary_file.replace(self.token_file)
+        try:
+            os.chmod(self.token_file, 0o600)
+        except OSError:
+            pass
+
+    def _invalidate_authentication(self) -> None:
+        self.access_token = ""
+        self._fyers = None
+        self._connected = False
+        self._auth_failure_latched = True
+        self._auth_state = "AUTHENTICATION_FAILED"
+        self._last_verified = None
+        try:
+            self._write_token_store({"invalidated": True})
+            self._token_store_invalidated = True
+        except OSError:
+            logger.warning("FYERS invalid token state could not be persisted")
+        logger.warning("FYERS authentication failed: invalid/expired token")
+
+    def _handle_response(self, response: dict, operation: str) -> dict:
+        if response.get("s") == "ok":
+            return response
+        if response.get("code") == -15 or "valid token" in str(response.get("message", "")).lower():
+            self._invalidate_authentication()
+            raise BrokerConnectionError("FYERS authentication required. Please reconnect FYERS.")
+        message = str(response.get("message", "request failed"))
+        self._auth_state = "API_ERROR"
+        raise BrokerConnectionError(f"FYERS {operation} failed: {message}")
+
+    def verify_connection(self) -> bool:
+        if self._auth_failure_latched or not self._fyers:
+            self._auth_state = "AUTHENTICATION_FAILED" if self._auth_failure_latched else "AUTHENTICATION_REQUIRED"
+            return False
+        try:
+            self._handle_response(self._fyers.quotes({"symbols": "NSE:NIFTY50-INDEX"}), "health check")
+        except BrokerConnectionError:
+            return False
         self._connected = True
+        self._auth_state = "CONNECTED"
+        self._last_verified = datetime.now(timezone.utc)
+        return True
+
+    def auth_status(self) -> dict:
+        if self._auth_state != "CONNECTED" and not self._auth_failure_latched:
+            self.verify_connection()
+        if self._auth_state == "CONNECTED":
+            message = "FYERS API authentication verified"
+        elif self._auth_state == "AUTHENTICATION_FAILED":
+            message = "FYERS authentication failed. Reconnect required."
+        elif self._auth_state == "API_ERROR":
+            message = "FYERS API is unavailable"
+        else:
+            message = "FYERS authentication required"
+        return {
+            "connected": self._auth_state == "CONNECTED",
+            "state": self._auth_state,
+            "message": message,
+            "last_verified": self._last_verified.isoformat() if self._last_verified else None,
+        }
 
     # ---------- Connection status ----------
     def is_connected(self) -> bool:
@@ -88,22 +194,22 @@ class FyersClient(BrokerClient):
 
     def _require_connected(self):
         if not self.is_connected():
-            raise BrokerConnectionError("Fyers session not authenticated/connected")
+            if self._auth_failure_latched:
+                raise BrokerConnectionError("FYERS authentication required. Please reconnect FYERS.")
+            raise BrokerConnectionError("FYERS authentication required")
 
     # ---------- Market data ----------
     def get_ltp(self, symbol: str) -> float:
         self._require_connected()
         resp = self._fyers.quotes({"symbols": symbol})
-        if resp.get("s") != "ok":
-            raise BrokerConnectionError(f"Fyers quotes error: {resp}")
+        self._handle_response(resp, "quotes")
         return float(resp["d"][0]["v"]["lp"])
 
     def get_quotes(self, symbols: list[str]) -> dict[str, dict]:
         """Return the broker's latest quote fields keyed by symbol."""
         self._require_connected()
         resp = self._fyers.quotes({"symbols": ",".join(symbols)})
-        if resp.get("s") != "ok":
-            raise BrokerConnectionError(f"Fyers quotes error: {resp}")
+        self._handle_response(resp, "quotes")
         quotes = {}
         for item in resp.get("d", []):
             value = item.get("v", {})
@@ -119,8 +225,7 @@ class FyersClient(BrokerClient):
         subsequent option-chain request."""
         self._require_connected()
         resp = self._fyers.optionchain({"symbol": symbol, "strikecount": 1, "timestamp": ""})
-        if resp.get("s") != "ok":
-            raise BrokerConnectionError(f"Fyers option chain error: {resp}")
+        self._handle_response(resp, "option chain")
         expiries = resp["data"].get("expiryData", [])
         if not expiries:
             raise BrokerConnectionError("No expiry data returned by broker")
@@ -134,8 +239,7 @@ class FyersClient(BrokerClient):
         """Return all broker-provided future expiries and cache their timestamps."""
         self._require_connected()
         resp = self._fyers.optionchain({"symbol": symbol, "strikecount": 1, "timestamp": ""})
-        if resp.get("s") != "ok":
-            raise BrokerConnectionError(f"Fyers option chain error: {resp}")
+        self._handle_response(resp, "option chain")
         expiries = []
         for item in resp.get("data", {}).get("expiryData", []):
             expiry_date = datetime.strptime(item["date"], "%d-%m-%Y").date()
@@ -150,8 +254,7 @@ class FyersClient(BrokerClient):
         self._require_connected()
         timestamp = self._expiry_timestamps.get(expiry, expiry)
         resp = self._fyers.optionchain({"symbol": symbol, "strikecount": 40, "timestamp": timestamp})
-        if resp.get("s") != "ok":
-            raise BrokerConnectionError(f"Fyers option chain error: {resp}")
+        self._handle_response(resp, "option chain")
 
         data = resp["data"]
         spot = float(data["optionsChain"][0]["ltp"]) if data.get("optionsChain") else 0.0
@@ -226,8 +329,7 @@ class FyersClient(BrokerClient):
     def get_margin_available(self) -> float:
         self._require_connected()
         resp = self._fyers.funds()
-        if resp.get("s") != "ok":
-            raise BrokerConnectionError(f"Fyers funds error: {resp}")
+        self._handle_response(resp, "funds")
         for item in resp.get("fund_limit", []):
             if item.get("title") == "Available Balance":
                 return float(item.get("equityAmount", 0))
@@ -236,8 +338,7 @@ class FyersClient(BrokerClient):
     def get_positions(self) -> list[dict]:
         self._require_connected()
         resp = self._fyers.positions()
-        if resp.get("s") != "ok":
-            raise BrokerConnectionError(f"Fyers positions error: {resp}")
+        self._handle_response(resp, "positions")
         return resp.get("netPositions", [])
 
     def get_basket_margin(self, orders: list[dict]) -> dict:
@@ -257,6 +358,9 @@ class FyersClient(BrokerClient):
         if not response.ok:
             raise BrokerConnectionError(f"Fyers margin calculator error: HTTP {response.status_code}")
         payload = response.json()
+        if payload.get("code") == -15 or "valid token" in str(payload.get("message", "")).lower():
+            self._invalidate_authentication()
+            raise BrokerConnectionError("FYERS authentication required. Please reconnect FYERS.")
         if payload.get("s") != "ok" or not payload.get("data"):
             raise BrokerConnectionError(f"Fyers margin calculator error: {payload.get('message', payload)}")
         return payload["data"]
@@ -266,7 +370,7 @@ class FyersClient(BrokerClient):
         self._require_connected()
         response = self._fyers.place_basket_orders({"data": orders})
         if response.get("s") != "ok":
-            raise BrokerConnectionError(f"Fyers basket order rejected: {response.get('message', response)}")
+            self._handle_response(response, "basket order")
         return response
 
     # ---------- Historical market data ----------
@@ -281,8 +385,7 @@ class FyersClient(BrokerClient):
             "cont_flag": "1",
         }
         resp = self._fyers.history(payload)
-        if resp.get("s") != "ok":
-            raise BrokerConnectionError(f"Fyers history error: {resp}")
+        self._handle_response(resp, "history")
         bars = []
         for row in resp.get("candles", []):
             ts, o, h, l, c, v = row
@@ -328,13 +431,16 @@ class FyersClient(BrokerClient):
         }
         resp = self._fyers.place_order(payload)
         if resp.get("s") != "ok":
+            self._handle_response(resp, "order")
             return OrderResult(order_id=None, status="REJECTED", raw=resp)
         return OrderResult(order_id=str(resp.get("id")), status="PENDING", raw=resp)
 
     def get_order_status(self, order_id: str) -> OrderResult:
         self._require_connected()
         resp = self._fyers.orderbook({"id": order_id})
-        if resp.get("s") != "ok" or not resp.get("orderBook"):
+        if resp.get("s") != "ok":
+            self._handle_response(resp, "order status")
+        if not resp.get("orderBook"):
             return OrderResult(order_id=order_id, status="UNKNOWN", raw=resp)
         order = resp["orderBook"][0]
         status_map = {1: "PENDING", 2: "FILLED", 5: "REJECTED", 6: "PENDING"}
