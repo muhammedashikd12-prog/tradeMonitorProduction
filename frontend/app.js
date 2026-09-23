@@ -10,6 +10,8 @@ async function api(path, options) { const response = await fetch(API + path, opt
 let optionChain = [];
 let activeTab = "LIVE";
 let authState = "AUTHENTICATION_REQUIRED";
+let chainRequestId = 0;
+let expiryRequestId = 0;
 function selectTab(tab) {
   activeTab = tab;
   const isHistory = tab === "HISTORY";
@@ -36,17 +38,27 @@ function populateChain(chain) {
 	});
 }
 async function loadChain(expiry) {
+  const requestId = ++chainRequestId;
 	clearLegSelections();
 	if (!expiry) return;
 	setChainMessage("Loading option chain...");
-	try { populateChain(await api(`/chain?expiry=${encodeURIComponent(expiry)}`)); }
+  try {
+    const chain = await api(`/chain?expiry=${encodeURIComponent(expiry)}`);
+    if (requestId === chainRequestId && $("expiry").value === expiry) populateChain(chain);
+  }
 	catch (error) { setChainMessage("Unable to load option chain. Please try again."); $("form-message").textContent = error.message; }
 }
 async function loadExpiries() {
+  const requestId = ++expiryRequestId;
+  const selectedExpiry = $("expiry").value;
 	try {
 		const data = await api("/expiries");
+		if (requestId !== expiryRequestId) return;
+		const currentExpiry = $("expiry").value || selectedExpiry;
+    if (currentExpiry) return;
 		$("expiry").innerHTML = '<option value="">Select expiry</option>' + data.expiries.map(expiry => `<option value="${expiry.value}">${expiry.label}</option>`).join("");
   } catch (error) {
+    if (requestId !== expiryRequestId || $("expiry").value) return;
     const message = authState === "AUTHENTICATION_REQUIRED" || authState === "AUTHENTICATION_FAILED" ? "FYERS authentication required" : "Unable to load expiries";
     $("expiry").innerHTML = `<option value="">${message}</option>`;
     $("form-message").textContent = error.message;
