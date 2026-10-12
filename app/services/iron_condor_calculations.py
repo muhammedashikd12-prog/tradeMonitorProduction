@@ -140,8 +140,9 @@ def calculate_position_charge_breakdown(legs: dict[str, Any], exit_ltps: dict[st
 
 
 def calculate_fund_requirement(legs: dict[str, Any], mode: str = "MARKET", live_ltps: dict[str, float | None] | None = None,
-                              quotes: dict[str, dict] | None = None, slippage_points: float = 0.05) -> dict[str, float]:
-    """Core fund requirement model: hedge BUY first, shorts SECOND, then net out proceeds and charges."""
+                              quotes: dict[str, dict] | None = None, slippage_points: float = 0.05,
+                              broker_margin: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return premium and charge estimates separately from broker margin."""
     call_buy = legs["CALL BUY"]
     call_sell = legs["CALL SELL"]
     put_sell = legs["PUT SELL"]
@@ -157,21 +158,51 @@ def calculate_fund_requirement(legs: dict[str, Any], mode: str = "MARKET", live_
         call_sell_price = float(call_sell.entry_price)
         put_sell_price = float(put_sell.entry_price)
         put_buy_price = float(put_buy.entry_price)
+
     gross_hedge_requirement = (call_buy_price * call_buy.quantity) + (put_buy_price * put_buy.quantity)
     short_leg_proceeds = (call_sell_price * call_sell.quantity) + (put_sell_price * put_sell.quantity)
+    long_leg_cost = gross_hedge_requirement
+    net_premium_cash_flow = short_leg_proceeds - long_leg_cost
     net_initial_cash_requirement = max(0.0, gross_hedge_requirement - short_leg_proceeds)
-    charges = (
+    estimated_charges = (
         calculate_fyers_leg_charges(call_buy_price, call_buy.quantity, "BUY")
         + calculate_fyers_leg_charges(call_sell_price, call_sell.quantity, "SELL")
         + calculate_fyers_leg_charges(put_sell_price, put_sell.quantity, "SELL")
         + calculate_fyers_leg_charges(put_buy_price, put_buy.quantity, "BUY")
     )
-    final_requirement = net_initial_cash_requirement + charges
+    margin_total = None
+    if broker_margin is not None and broker_margin.get("margin_total") is not None:
+        margin_total = float(broker_margin["margin_total"])
+    gross_margin_requirement = (
+        float(broker_margin["gross_margin_requirement"])
+        if broker_margin and broker_margin.get("gross_margin_requirement") is not None else None
+    )
+    hedge_benefit = (
+        float(broker_margin["hedge_benefit"])
+        if broker_margin and broker_margin.get("hedge_benefit") is not None else None
+    )
+    net_margin_requirement = (
+        float(broker_margin["net_margin_requirement"])
+        if broker_margin and broker_margin.get("net_margin_requirement") is not None
+        else margin_total
+    )
+    final_requirement = net_margin_requirement + estimated_charges if net_margin_requirement is not None else None
+
     return {
         "gross_hedge_requirement": gross_hedge_requirement,
         "short_leg_proceeds": short_leg_proceeds,
+        "long_leg_cost": long_leg_cost,
+        "long_leg_premium_debit": long_leg_cost,
         "net_initial_cash_requirement": net_initial_cash_requirement,
-        "charges": charges,
+        "short_leg_premium_credit": short_leg_proceeds,
+        "net_premium_cash_flow": net_premium_cash_flow,
+        "gross_margin_requirement": gross_margin_requirement,
+        "hedge_benefit": hedge_benefit,
+        "net_margin_requirement": net_margin_requirement,
+        "estimated_charges": estimated_charges,
+        "charges": estimated_charges,
+        "margin_source": "FYERS_MARGIN_CALCULATOR" if margin_total is not None else "UNAVAILABLE",
+        "final_funds_required": final_requirement,
         "final_estimated_fund_requirement": final_requirement,
     }
 

@@ -16,6 +16,7 @@ Auth flow (one-time, interactive — cannot be done headlessly):
 from __future__ import annotations
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import time
@@ -350,20 +351,35 @@ class FyersClient(BrokerClient):
         """
         self._require_connected()
         import requests
-        response = requests.post(
-            "https://api-t1.fyers.in/api/v3/multiorder/margin",
-            headers={"Authorization": f"{self.app_id}:{self.access_token}", "Content-Type": "application/json"},
-            json={"data": orders}, timeout=10,
-        )
+        try:
+            response = requests.post(
+                "https://api-t1.fyers.in/api/v3/multiorder/margin",
+                headers={"Authorization": f"{self.app_id}:{self.access_token}", "Content-Type": "application/json"},
+                json={"data": orders}, timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise BrokerConnectionError(f"Fyers margin calculator unavailable: {exc}") from exc
         if not response.ok:
             raise BrokerConnectionError(f"Fyers margin calculator error: HTTP {response.status_code}")
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise BrokerConnectionError("Fyers margin calculator returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise BrokerConnectionError("Fyers margin calculator returned an invalid response")
         if payload.get("code") == -15 or "valid token" in str(payload.get("message", "")).lower():
             self._invalidate_authentication()
             raise BrokerConnectionError("FYERS authentication required. Please reconnect FYERS.")
-        if payload.get("s") != "ok" or not payload.get("data"):
+        if payload.get("s") != "ok" or not isinstance(payload.get("data"), dict):
             raise BrokerConnectionError(f"Fyers margin calculator error: {payload.get('message', payload)}")
-        return payload["data"]
+        data = payload["data"]
+        try:
+            margin_total = float(data["margin_total"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise BrokerConnectionError("Fyers margin calculator response is missing margin_total") from exc
+        if not math.isfinite(margin_total) or margin_total < 0:
+            raise BrokerConnectionError("Fyers margin calculator returned an invalid margin_total")
+        return data | {"margin_total": margin_total}
 
     def place_basket_orders(self, orders: list[dict]) -> dict:
         """Place an already-reviewed basket. Never call this for paper mode."""

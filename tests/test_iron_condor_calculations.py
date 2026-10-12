@@ -1,10 +1,16 @@
 import unittest
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from app.main import ManualLeg, ManualMonitorSetup, _fyers_basket_orders
+from app.models import OptionChainSnapshot, OptionQuote
 from app.services.iron_condor_calculations import (
     calculate_position, calculate_advance_sl, advance_sl_state,
     calculate_position_charge_breakdown, calculate_position_charges,
+    calculate_fund_requirement,
 )
+from app.services.iv_greeks_engine import calculate_current_atm_iv
 
 
 def _legs():
@@ -17,6 +23,29 @@ def _legs():
 
 
 class IronCondorCalculationTests(unittest.TestCase):
+    def test_current_atm_iv_averages_nearest_live_call_and_put(self):
+        chain = OptionChainSnapshot(
+            spot=22010,
+            timestamp=datetime.now(),
+            expiry=date.today() + timedelta(days=4),
+            quotes=[
+                OptionQuote(strike=22000, option_type="CE", ltp=100, bid=99, ask=101),
+                OptionQuote(strike=22000, option_type="PE", ltp=90, bid=89, ask=91),
+                OptionQuote(strike=22100, option_type="CE", ltp=60, bid=59, ask=61),
+            ],
+        )
+        with patch("app.services.iv_greeks_engine.black_scholes_iv_estimate", side_effect=[12.0, 16.0]):
+            self.assertEqual(calculate_current_atm_iv(chain), 14.0)
+
+    def test_current_atm_iv_returns_none_without_a_valid_call_put_pair(self):
+        chain = OptionChainSnapshot(
+            spot=22000,
+            timestamp=datetime.now(),
+            expiry=date.today() + timedelta(days=4),
+            quotes=[OptionQuote(strike=22000, option_type="CE", ltp=100, bid=99, ask=101)],
+        )
+        self.assertIsNone(calculate_current_atm_iv(chain))
+
     def test_credit_and_stop_loss_are_quantity_aware(self):
         result = calculate_position(_legs(), {})
         self.assertEqual(result["call_credit"]["total"], 150)
@@ -66,3 +95,82 @@ class IronCondorCalculationTests(unittest.TestCase):
         self.assertAlmostEqual(sum(breakdown.values()), calculate_position_charges(_legs(), {
             "CALL BUY": 6, "CALL SELL": 14, "PUT SELL": 8, "PUT BUY": 3,
         }))
+
+    def test_fund_requirement_breakdown_includes_basket_margin_fields(self):
+        result = calculate_fund_requirement(_legs(), broker_margin={"margin_total": 1234.5})
+        self.assertIn("gross_margin_requirement", result)
+        self.assertIn("hedge_benefit", result)
+        self.assertIn("net_margin_requirement", result)
+        self.assertIn("short_leg_premium_credit", result)
+        self.assertIn("long_leg_premium_debit", result)
+        self.assertIn("net_premium_cash_flow", result)
+        self.assertIn("estimated_charges", result)
+        self.assertIn("final_funds_required", result)
+        self.assertAlmostEqual(result["final_funds_required"], 1234.5 + result["estimated_charges"])
+        self.assertAlmostEqual(result["final_estimated_fund_requirement"], 1234.5 + result["estimated_charges"])
+
+    def test_fund_requirement_does_not_infer_margin_from_premiums(self):
+        result = calculate_fund_requirement(_legs())
+        self.assertEqual(result["margin_source"], "UNAVAILABLE")
+        self.assertIsNone(result["gross_margin_requirement"])
+        self.assertIsNone(result["hedge_benefit"])
+        self.assertIsNone(result["net_margin_requirement"])
+        self.assertIsNone(result["final_funds_required"])
+        self.assertGreater(result["net_premium_cash_flow"], 0)
+
+    def test_manual_monitor_uses_master_quantity_and_multiplier(self):
+        setup = ManualMonitorSetup(
+            expiry=date.today(),
+            base_quantity=65,
+            multiplier=2,
+            legs=[
+                ManualLeg(leg="CALL BUY", symbol="NSE:ABC-CE-1", strike=21400, quantity=65, entry_price=100),
+                ManualLeg(leg="CALL SELL", symbol="NSE:ABC-CE-2", strike=23150, quantity=65, entry_price=100),
+                ManualLeg(leg="PUT SELL", symbol="NSE:ABC-PE-2", strike=22500, quantity=65, entry_price=100),
+                ManualLeg(leg="PUT BUY", symbol="NSE:ABC-PE-1", strike=22150, quantity=65, entry_price=100),
+            ],
+        )
+        self.assertEqual(setup.effective_quantity, 130)
+        self.assertTrue(all(leg.quantity == 130 for leg in setup.legs))
+
+    def test_fyers_basket_orders_keep_effective_quantity_and_buy_hedges_first(self):
+        setup = ManualMonitorSetup(
+            expiry=date.today(), base_quantity=65, multiplier=2,
+            legs=[
+                ManualLeg(leg="CALL BUY", symbol="NSE:ABC-CE-1", strike=23750, quantity=65, entry_price=2.4),
+                ManualLeg(leg="CALL SELL", symbol="NSE:ABC-CE-2", strike=23150, quantity=65, entry_price=9.4),
+                ManualLeg(leg="PUT SELL", symbol="NSE:ABC-PE-2", strike=22500, quantity=65, entry_price=10.35),
+                ManualLeg(leg="PUT BUY", symbol="NSE:ABC-PE-1", strike=22250, quantity=65, entry_price=2.5),
+            ],
+        )
+        orders = _fyers_basket_orders(setup.legs)
+        self.assertEqual([order["qty"] for order in orders], [130, 130, 130, 130])
+        self.assertEqual([order["side"] for order in orders], [1, 1, -1, -1])
+        self.assertTrue(all(order["productType"] == "MARGIN" for order in orders))
+
+    def test_master_quantity_rejects_invalid_values(self):
+        with self.assertRaises(ValueError):
+            ManualMonitorSetup(
+                expiry=date.today(),
+                base_quantity=0,
+                multiplier=1,
+                legs=[
+                    ManualLeg(leg="CALL BUY", symbol="NSE:ABC-CE-1", strike=21400, quantity=1, entry_price=100),
+                    ManualLeg(leg="CALL SELL", symbol="NSE:ABC-CE-2", strike=23150, quantity=1, entry_price=100),
+                    ManualLeg(leg="PUT SELL", symbol="NSE:ABC-PE-2", strike=22500, quantity=1, entry_price=100),
+                    ManualLeg(leg="PUT BUY", symbol="NSE:ABC-PE-1", strike=22150, quantity=1, entry_price=100),
+                ],
+            )
+
+        with self.assertRaises(ValueError):
+            ManualMonitorSetup(
+                expiry=date.today(),
+                base_quantity=65,
+                multiplier=0,
+                legs=[
+                    ManualLeg(leg="CALL BUY", symbol="NSE:ABC-CE-1", strike=21400, quantity=65, entry_price=100),
+                    ManualLeg(leg="CALL SELL", symbol="NSE:ABC-CE-2", strike=23150, quantity=65, entry_price=100),
+                    ManualLeg(leg="PUT SELL", symbol="NSE:ABC-PE-2", strike=22500, quantity=65, entry_price=100),
+                    ManualLeg(leg="PUT BUY", symbol="NSE:ABC-PE-1", strike=22150, quantity=65, entry_price=100),
+                ],
+            )

@@ -2,6 +2,8 @@
 the IV regime using CONFIGURABLE thresholds (never hardcoded truth)."""
 from __future__ import annotations
 from collections import deque
+from datetime import datetime, time, timedelta, timezone
+import math
 from statistics import NormalDist
 from typing import Optional
 from app.models import OptionChainSnapshot, IVResult
@@ -46,6 +48,50 @@ def black_scholes_iv_estimate(price: float, spot: float, strike: float, t_years:
         sigma -= diff / vega
         sigma = max(0.01, min(sigma, 3.0))
     return round(sigma * 100, 2)
+
+
+def calculate_current_atm_iv(chain: OptionChainSnapshot) -> Optional[float]:
+    """Average call/put Black-Scholes IV at the nearest usable strike.
+
+    Uses the live bid/ask midpoint, falling back to LTP when a two-sided quote
+    is unavailable. Time to expiry uses the selected expiry's 15:30 IST close.
+    """
+    spot = chain.spot
+    if not math.isfinite(spot) or spot <= 0:
+        return None
+    expiry_close_ist = datetime.combine(
+        chain.expiry, time(15, 30), tzinfo=timezone(timedelta(hours=5, minutes=30))
+    )
+    t_years = (expiry_close_ist.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds() / (365 * 86400)
+    if t_years <= 0:
+        return None
+
+    quotes_by_strike = {}
+    for quote in chain.quotes:
+        if quote.option_type in ("CE", "PE"):
+            quotes_by_strike.setdefault(quote.strike, {})[quote.option_type] = quote
+
+    for strike in sorted(quotes_by_strike, key=lambda value: abs(value - spot)):
+        pair = quotes_by_strike[strike]
+        if "CE" not in pair or "PE" not in pair:
+            continue
+        estimates = []
+        for option_type in ("CE", "PE"):
+            quote = pair[option_type]
+            bid, ask = quote.bid, quote.ask
+            if math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask >= bid:
+                premium = (bid + ask) / 2
+            else:
+                premium = quote.ltp
+            if not math.isfinite(premium) or premium <= 0:
+                break
+            estimate = black_scholes_iv_estimate(premium, spot, strike, t_years, option_type=option_type)
+            if estimate is None or not math.isfinite(estimate) or estimate <= 0:
+                break
+            estimates.append(estimate)
+        if len(estimates) == 2:
+            return round(sum(estimates) / 2, 2)
+    return None
 
 
 def np_log(x: float) -> float:

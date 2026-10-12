@@ -12,6 +12,39 @@ let activeTab = "LIVE";
 let authState = "AUTHENTICATION_REQUIRED";
 let chainRequestId = 0;
 let expiryRequestId = 0;
+function getBaseQuantity() {
+  const value = Number($("base-quantity").value);
+  if (!Number.isFinite(value) || value <= 0 || !Number.isInteger(value)) return 1;
+  return value;
+}
+function getMultiplier() {
+  const value = Number($("multiplier").value);
+  if (!Number.isFinite(value) || value <= 0 || !Number.isInteger(value)) return 1;
+  return value;
+}
+function getEffectiveQuantity() { return getBaseQuantity() * getMultiplier(); }
+function syncMasterQuantityControls() {
+  const base = Math.max(1, getBaseQuantity());
+  const multiplier = Math.max(1, getMultiplier());
+  const effective = base * multiplier;
+  $("base-quantity").value = String(base);
+  $("multiplier").value = String(multiplier);
+  $("effective-quantity").textContent = String(effective);
+  document.querySelectorAll('[data-field="quantity"]').forEach(input => { input.value = String(effective); });
+}
+function bindMultiplierButtons() {
+  document.querySelectorAll("[data-multiplier-action]").forEach(button => {
+    button.addEventListener("click", () => {
+      const action = button.dataset.multiplierAction;
+      const current = getMultiplier();
+      const next = action === "increase" ? current + 1 : Math.max(1, current - 1);
+      $("multiplier").value = String(next);
+      syncMasterQuantityControls();
+      updateSlPreview();
+      updateFundPreview();
+    });
+  });
+}
 function selectTab(tab) {
   activeTab = tab;
   const isHistory = tab === "HISTORY";
@@ -74,9 +107,9 @@ document.querySelectorAll('[data-field="strike"]').forEach(select => select.addE
 	document.querySelector(`[data-leg="${leg}"][data-field="entry_price"]`).value = quote.ltp;
 }));
 $("connect-fyers").addEventListener("click", async () => { try { const result = await api("/fyers/login-url"); window.location.href = result.url; } catch (error) { $("alerts").innerHTML = `<li>⚠ Could not start FYERS login: ${error.message}</li>`; } });
-function collectLegs() { return ["CALL BUY", "CALL SELL", "PUT SELL", "PUT BUY"].map(name => { const values = {leg: name}; document.querySelectorAll(`[data-leg="${name}"]`).forEach(input => { values[input.dataset.field] = ["number", "select-one"].includes(input.type) ? Number(input.value) : input.value.trim(); }); return values; }); }
-function previewPayload() { return {expiry: $("expiry").value, mode: $("mode-select").value, slippage_points: Number($("slippage-points").value || 0.05), call_sl: null, put_sl: null, legs: collectLegs()}; }
-function previewReady() { return Boolean($("expiry").value) && collectLegs().every(leg => leg.symbol && leg.strike > 0 && leg.quantity > 0 && leg.entry_price > 0); }
+function collectLegs() { return ["CALL BUY", "CALL SELL", "PUT SELL", "PUT BUY"].map(name => { const values = {leg: name}; document.querySelectorAll(`[data-leg="${name}"]`).forEach(input => { values[input.dataset.field] = ["number", "select-one"].includes(input.type) ? Number(input.value) : input.value.trim(); }); values.quantity = getEffectiveQuantity(); return values; }); }
+function previewPayload() { return {expiry: $("expiry").value, mode: $("mode-select").value, base_quantity: getBaseQuantity(), multiplier: getMultiplier(), slippage_points: Number($("slippage-points").value || 0.05), call_sl: null, put_sl: null, legs: collectLegs()}; }
+function previewReady() { const base = getBaseQuantity(); const mult = getMultiplier(); return Boolean($("expiry").value) && Number.isInteger(base) && base > 0 && Number.isInteger(mult) && mult > 0 && collectLegs().every(leg => leg.symbol && leg.strike > 0 && leg.quantity > 0 && leg.entry_price > 0); }
 function renderSlPreview(data) {
   const set = (id, value, digits = 0, prefix = "₹") => $(id).textContent = value == null ? "—" : `${prefix}${fmt(value, digits)}`;
   const allLegs = data?.legs || collectLegs();
@@ -115,7 +148,39 @@ function renderSlPreview(data) {
   });
 }
 let previewTimer; async function updateSlPreview() { clearTimeout(previewTimer); previewTimer = setTimeout(async () => { if (!previewReady()) { renderSlPreview({available: false}); return; } try { renderSlPreview(await api("/manual-monitor/preview", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(previewPayload())})); } catch (error) { renderSlPreview({available: false, message: error.message}); } }, 250); }
-document.querySelectorAll("#setup-form input, #setup-form select").forEach(input => input.addEventListener("input", updateSlPreview)); document.querySelectorAll("#setup-form input, #setup-form select").forEach(input => input.addEventListener("change", updateSlPreview));
+let fundPreviewTimer; let fundPreviewRequestId = 0;
+async function updateFundPreview() {
+  clearTimeout(fundPreviewTimer);
+  const requestId = ++fundPreviewRequestId;
+  if (!previewReady()) {
+    renderFund({margin_source: "UNAVAILABLE", margin_warning: "Select an expiry and enter all four legs to preview basket margin"}, activeTab);
+    return;
+  }
+  fundPreviewTimer = setTimeout(async () => {
+    try {
+      const preview = await api("/basket/preview", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(previewPayload())});
+      if (requestId !== fundPreviewRequestId) return;
+      renderFund({...preview.fund_estimate, available_funds: preview.available_funds, margin_warning: preview.margin_warning}, preview.mode);
+    } catch (error) {
+      if (requestId !== fundPreviewRequestId) return;
+      renderFund({margin_source: "UNAVAILABLE", margin_warning: error.message}, activeTab);
+    }
+  }, 500);
+}
+["base-quantity", "multiplier"].forEach(id => {
+  $(id).addEventListener("input", () => {
+    const value = Number($(id).value);
+    if (!Number.isFinite(value) || value <= 0 || !Number.isInteger(value)) {
+      $(id).value = "1";
+    }
+    syncMasterQuantityControls();
+    updateSlPreview();
+  });
+});
+document.querySelectorAll("#setup-form input, #setup-form select").forEach(input => {
+  input.addEventListener("input", () => { updateSlPreview(); updateFundPreview(); });
+  input.addEventListener("change", () => { updateSlPreview(); updateFundPreview(); });
+});
 $("setup-form").addEventListener("submit", async event => { event.preventDefault(); $("form-message").textContent = ""; try { const result = await api("/manual-monitor/setup", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(previewPayload())}); $("form-message").textContent = `${result.mode} position active: ${result.position_id}`; await refresh(); await loadHistory(); } catch (error) { $("form-message").textContent = error.message; } });
 $("clear-position").addEventListener("click", async () => { if (!window.confirm("Stop monitoring the active position? Its history will be kept.")) return; await api(`/manual-monitor/setup?mode=${activeTab}`, {method: "DELETE"}); await refresh(); await loadHistory(); });
 $("close-position").addEventListener("click", async () => { await api(`/manual-monitor/close?reason=MANUALLY+CLOSED&mode=${activeTab}`); await refresh(); await loadHistory(); });
@@ -149,12 +214,12 @@ async function loadHistory() { try { const list = await api("/manual-monitor/his
 async function refreshHistory() {
   await loadHistory();
 }
-function renderFund(fund, mode) { if (!fund) return; $("fund-mode-tag").textContent = mode || "MARKET"; $("gross-hedge").textContent = `₹${fmt(fund.gross_hedge_requirement, 0)}`; $("short-proceeds").textContent = `₹${fmt(fund.short_leg_proceeds, 0)}`; $("net-cash").textContent = `₹${fmt(fund.net_initial_cash_requirement, 0)}`; $("fund-charges").textContent = `₹${fmt(fund.charges, 0)}`; $("final-funds").textContent = `₹${fmt(fund.final_estimated_fund_requirement, 0)}`; }
+function renderFund(fund, mode) { if (!fund) return; const marginAvailable = fund.margin_source === "FYERS_MARGIN_CALCULATOR"; const finalFunds = fund.final_funds_required; const availableFunds = fund.available_funds; $("fund-mode-tag").textContent = marginAvailable ? `${mode || "LIVE"} · FYERS MARGIN` : `${mode || "LIVE"} · MARGIN UNAVAILABLE`; $("fund-margin-note").textContent = fund.margin_warning || (marginAvailable ? "Basket margin from Fyers; premium cash flow and estimated charges are shown separately." : "No broker margin result; final funds are not estimated."); $("gross-hedge").textContent = fund.gross_margin_requirement == null ? "—" : `₹${fmt(fund.gross_margin_requirement, 0)}`; $("hedge-benefit").textContent = fund.hedge_benefit == null ? "—" : `−₹${fmt(fund.hedge_benefit, 0)}`; $("net-cash").textContent = fund.net_margin_requirement == null ? "—" : `₹${fmt(fund.net_margin_requirement, 0)}`; $("short-proceeds").textContent = `₹${fmt(fund.short_leg_premium_credit ?? fund.short_leg_proceeds, 0)}`; $("long-debit").textContent = `₹${fmt(fund.long_leg_premium_debit ?? fund.long_leg_cost, 0)}`; $("net-premium").textContent = `₹${fmt(fund.net_premium_cash_flow, 0)}`; $("fund-charges").textContent = fund.estimated_charges == null ? "—" : `₹${fmt(fund.estimated_charges, 0)}`; $("final-funds").textContent = finalFunds == null ? "—" : `₹${fmt(finalFunds, 0)}`; $("fund-available").textContent = availableFunds == null ? "—" : `₹${fmt(availableFunds, 0)}`; $("fund-status").textContent = finalFunds == null || availableFunds == null ? "—" : availableFunds >= finalFunds ? "Sufficient funds" : "Insufficient funds"; }
 function renderLadder(data) { ["lower_hedge", "lower_short", "lower_breakeven", "spot", "upper_breakeven", "upper_short", "upper_hedge"].forEach(key => { const className = key === "spot" ? "spot-mark" : key.replace("_", "-"); const el = document.querySelector(`.${className}`); if (el && data[key] !== undefined) el.textContent = key === "spot" ? "●" : fmt(data[key], 0); }); const spot = document.querySelector(".spot-mark"); const range = Number(data.upper_hedge) - Number(data.lower_hedge); if (spot && Number.isFinite(Number(data.spot)) && range > 0) { const position = Math.max(0, Math.min(162, (Number(data.upper_hedge) - Number(data.spot)) / range * 162)); spot.style.top = `${position}px`; } }
 function timeLeft(seconds) { if (seconds === undefined) return "—"; const d = Math.floor(seconds / 86400); const h = Math.floor(seconds % 86400 / 3600); const m = Math.floor(seconds % 3600 / 60); return `${d ? `${String(d).padStart(2, "0")}D ` : ""}${String(h).padStart(2, "0")}H ${String(m).padStart(2, "0")}M`; }
 function render(data) { setConnection(data.connection || "DISCONNECTED"); $("last-update").textContent = `Updated ${new Date().toLocaleTimeString()}`; if (!data.configured) return; $("expiry-label").textContent = new Date(`${data.expiry}T00:00:00`).toLocaleDateString("en-IN", {weekday: "long", day: "2-digit", month: "short", year: "numeric"}); if (data.spot === undefined) { renderLegs(data.legs || []); return; } $("spot").textContent = `₹${fmt(data.spot, 1)}`; $("spot-change").textContent = `${signed(data.spot_change)} ${data.spot_change_pct == null ? "" : `(${signed(data.spot_change_pct)}%)`}`; $("time-left").textContent = timeLeft(data.seconds_to_expiry); $("total-pnl").textContent = money(data.total_pnl); $("total-pnl").className = `pnl-value ${pnlClass(data.total_pnl)}`; $("today-pnl").textContent = money(data.total_pnl); $("today-pnl").className = `pnl-value ${pnlClass(data.total_pnl)}`; renderLegs(data.legs); renderCharges(data.charges, data.total_gross_pnl, data.net_pnl, data.net_pnl_pct); $("call-credit").textContent = `₹${fmt(data.call_credit)}`; $("put-credit").textContent = `₹${fmt(data.put_credit)}`; $("net-credit").textContent = `₹${fmt(data.net_credit)}`; $("max-profit").textContent = `₹${fmt(data.max_initial_profit, 0)}`; $("call-spread-pnl").textContent = money(data.call_spread_pnl); $("put-spread-pnl").textContent = money(data.put_spread_pnl); $("distance-put").textContent = `${fmt(Math.abs(data.distance_put_short), 0)} pts`; $("distance-call").textContent = `${fmt(Math.abs(data.distance_call_short), 0)} pts`; $("distance-lower-be").textContent = `${fmt(Math.abs(data.distance_lower_breakeven), 0)} pts`; $("distance-upper-be").textContent = `${fmt(Math.abs(data.distance_upper_breakeven), 0)} pts`; $("risk-badge").textContent = data.risk; $("risk-badge").className = `risk-badge ${data.risk === "WARNING" ? "watch" : data.risk.toLowerCase()}`; renderLadder(data); $("call-iv").textContent = data.call_iv == null ? "—" : `${fmt(data.call_iv, 1)}%`; $("put-iv").textContent = data.put_iv == null ? "—" : `${fmt(data.put_iv, 1)}%`; $("average-iv").textContent = data.average_short_iv == null ? "—" : `${fmt(data.average_short_iv, 1)}% (${signed(data.iv_change)})`; $("call-sl-status").textContent = data.call_sl == null ? "Not set" : `₹${fmt(data.call_sl, 0)} / ${money(data.call_spread_pnl)}`; $("put-sl-status").textContent = data.put_sl == null ? "Not set" : `₹${fmt(data.put_sl, 0)} / ${money(data.put_spread_pnl)}`; $("alerts").innerHTML = data.alerts?.length ? data.alerts.map(alert => `<li>⚠ ${alert}</li>`).join("") : `<li class="subtle">No alerts.</li>`; }
 function renderSlMonitor(data) { if (!data || !data.configured) return; const advance = data.advance_sl || {}; const call = advance.call || {}; const put = advance.put || {}; renderSlPreview({available: true, spot: data.spot, legs: data.legs, call, put, call_sl_state: data.call_sl_state, put_sl_state: data.put_sl_state, call_sl_triggered: data.call_sl_triggered, put_sl_triggered: data.put_sl_triggered}); $("call-sl-status").textContent = `${slLabel(data.call_sl_state)} · ${call.sl_trigger_price == null ? "SL trigger unavailable" : `NIFTY ${fmt(call.sl_trigger_price, 0)}`} / ${money(data.call_spread_pnl)}`; $("put-sl-status").textContent = `${slLabel(data.put_sl_state)} · ${put.sl_trigger_price == null ? "SL trigger unavailable" : `NIFTY ${fmt(put.sl_trigger_price, 0)}`} / ${money(data.put_spread_pnl)}`; }
 const baseRender = render;
 render = data => { baseRender(data); renderSlMonitor(data); if (data.configured && data.spot !== undefined) { $("total-pnl").textContent = money(data.net_pnl); $("total-pnl").className = `pnl-value ${pnlClass(data.net_pnl)}`; $("today-pnl").textContent = money(data.net_pnl); $("today-pnl").className = `pnl-value ${pnlClass(data.net_pnl)}`; } };
-async function refresh() { if (activeTab === "HISTORY") return; try { const snapshot = await api(`/manual-monitor?mode=${activeTab}`); render(snapshot); renderFund(snapshot.fund_requirement, snapshot.mode); } catch (error) { $("alerts").innerHTML = `<li>⚠ ${error.message}</li>`; } }
-loadAuthStatus(); loadHistory(); refresh(); setInterval(loadAuthStatus, 5000); setInterval(refresh, 3000); setInterval(() => { if (activeTab === "HISTORY") refreshHistory(); }, 3000);
+async function refresh() { if (activeTab === "HISTORY") return; try { const snapshot = await api(`/manual-monitor?mode=${activeTab}`); $("current-iv").textContent = snapshot.current_iv == null ? "--" : `${fmt(snapshot.current_iv, 2)}%`; render(snapshot); if (!previewReady()) renderFund(snapshot.fund_requirement, snapshot.mode); } catch (error) { $("current-iv").textContent = "--"; $("alerts").innerHTML = `<li>⚠ ${error.message}</li>`; } }
+bindMultiplierButtons(); syncMasterQuantityControls(); loadAuthStatus(); loadHistory(); refresh(); setInterval(loadAuthStatus, 5000); setInterval(refresh, 3000); setInterval(() => { if (activeTab === "HISTORY") refreshHistory(); }, 3000);

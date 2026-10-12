@@ -3,9 +3,10 @@ a WebSocket broadcast for the frontend dashboard."""
 from __future__ import annotations
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 from pathlib import Path
-from datetime import datetime, date, time as date_time
+from datetime import datetime, date, time as date_time, timezone, timedelta
 from typing import Literal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
 from fastapi.responses import RedirectResponse
@@ -14,11 +15,11 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import get_session, export_journal_csv, SessionLocal, PositionHistoryEntry
+from app.database import get_session, export_journal_csv, SessionLocal, PositionHistoryEntry, PositionHistoryLeg
 from app.brokers.fyers_client import FyersClient
 from app.brokers.base import BrokerConnectionError
 from app.models import IronCondorStructure
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from app.services import strategy_engine, position_sizing, daily_loss_drawdown
 from app.services import risk_engine, stop_loss_engine, profit_booking_engine
 from app.services import journal_service, notification_service, execution_engine
@@ -28,8 +29,10 @@ from app.services.iron_condor_calculations import (
     calculate_position_charges, calculate_advance_sl, advance_sl_state,
     calculate_position_charge_breakdown,
 )
+from app.services.iv_greeks_engine import calculate_current_atm_iv
 
 app = FastAPI(title="Condor AI")
+logger = logging.getLogger(__name__)
 
 # Local frontend (opened as a file or served on any localhost port) needs
 # CORS to call this API from a different origin during development.
@@ -65,14 +68,69 @@ class ManualLeg(BaseModel):
     entry_price: float = Field(gt=0)
     order_type: Literal["MARKET", "LIMIT"] = "MARKET"
 
+    @field_validator("quantity", mode="before")
+    @classmethod
+    def validate_quantity(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("Quantity must be a positive integer")
+        if isinstance(value, float):
+            if not value.is_integer():
+                raise ValueError("Quantity must be a positive integer")
+            value = int(value)
+        elif isinstance(value, str):
+            stripped = value.strip()
+            if not stripped or not stripped.isdigit():
+                raise ValueError("Quantity must be a positive integer")
+            value = int(stripped)
+        if int(value) <= 0:
+            raise ValueError("Quantity must be a positive integer")
+        return int(value)
+
 
 class ManualMonitorSetup(BaseModel):
     expiry: date
+    base_quantity: int | None = Field(default=None, gt=0)
+    multiplier: int = Field(default=1, gt=0)
     legs: list[ManualLeg] = Field(min_length=4, max_length=4)
     call_sl: float | None = Field(default=None, ge=0)
     put_sl: float | None = Field(default=None, ge=0)
     mode: Literal["LIVE", "PAPER", "MARKET"] = "LIVE"
     slippage_points: float = Field(default=0.05, ge=0, le=2.0)
+
+    @property
+    def effective_quantity(self) -> int:
+        return int(self.base_quantity or 1) * int(self.multiplier or 1)
+
+    @field_validator("base_quantity", "multiplier", mode="before")
+    @classmethod
+    def validate_master_quantity(cls, value, info):
+        if value is None:
+            return value
+        if isinstance(value, bool):
+            raise ValueError(f"{info.field_name} must be a positive integer")
+        if isinstance(value, float):
+            if not value.is_integer():
+                raise ValueError(f"{info.field_name} must be a positive integer")
+            value = int(value)
+        elif isinstance(value, str):
+            stripped = value.strip()
+            if not stripped or not stripped.isdigit():
+                raise ValueError(f"{info.field_name} must be a positive integer")
+            value = int(stripped)
+        if int(value) <= 0:
+            raise ValueError(f"{info.field_name} must be a positive integer")
+        return int(value)
+
+    @model_validator(mode="after")
+    def normalise_leg_quantities(self):
+        if not self.legs:
+            return self
+        if self.base_quantity is None:
+            self.base_quantity = max(leg.quantity for leg in self.legs)
+        effective = self.effective_quantity
+        for leg in self.legs:
+            leg.quantity = effective
+        return self
 
 
 class BasketPlacement(ManualMonitorSetup):
@@ -92,6 +150,54 @@ _manual_active_history_id: str | None = None
 
 def _normalise_mode(mode: str) -> str:
     return "PAPER" if mode == "PAPER" else "LIVE"
+
+
+def _expiry_cutoff_utc(expiry_value: str | date) -> datetime:
+    expiry_date = expiry_value if isinstance(expiry_value, date) else date.fromisoformat(str(expiry_value))
+    local_cutoff = datetime.combine(expiry_date, date_time(15, 30), tzinfo=timezone(timedelta(hours=5, minutes=30)))
+    return local_cutoff.astimezone(timezone.utc)
+
+
+def _expire_due_positions(db: Session | None = None) -> None:
+    owns_session = db is None
+    session = db or SessionLocal()
+    now = datetime.now(timezone.utc)
+    changed = False
+    try:
+        rows = session.query(PositionHistoryEntry).filter_by(status="OPEN").all()
+        for row in rows:
+            if not row.expiry or row.snapshot_frozen:
+                continue
+            try:
+                cutoff = _expiry_cutoff_utc(row.expiry)
+            except (TypeError, ValueError):
+                continue
+            if now < cutoff:
+                continue
+            legs = session.query(PositionHistoryLeg).filter_by(position_history_id=row.id).all()
+            captured = sum(leg.exit_price is not None for leg in legs)
+            row.status = "EXPIRED"
+            row.closed_at = cutoff.replace(tzinfo=None)
+            row.reason_for_closing = row.reason_for_closing or "Option expired; final settlement not captured"
+            row.updated_at = datetime.utcnow()
+            row.snapshot_frozen = 1
+            if row.realized_pnl is not None:
+                row.gross_pnl = row.realized_pnl
+            row.pnl_basis = row.pnl_basis or ("LAST_MARK" if row.gross_pnl is not None else "NOT_CAPTURED")
+            row.exit_capture_status = "CAPTURED" if captured == 4 else "PARTIAL" if captured else "NOT_CAPTURED"
+            if row.net_pnl is not None:
+                entry_value = sum((leg.entry_value or 0.0) for leg in legs)
+                if entry_value:
+                    row.net_pnl_percent = row.net_pnl / entry_value * 100
+            changed = True
+        if changed:
+            session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        if owns_session:
+            session.close()
 
 
 def _activate_manual_mode(mode: str) -> str:
@@ -121,6 +227,7 @@ _main_loop: asyncio.AbstractEventLoop | None = None
 async def _capture_loop():
     global _main_loop
     _main_loop = asyncio.get_running_loop()
+    _expire_due_positions()
 
 
 def broadcast_sync(payload: dict) -> None:
@@ -255,22 +362,12 @@ def close_manual_monitor(reason: str = "MANUALLY CLOSED", mode: str = "LIVE"):
 @app.get("/manual-monitor/history")
 def manual_history():
     db = SessionLocal()
-    rows = db.query(PositionHistoryEntry).order_by(PositionHistoryEntry.created_at.desc()).all()
-    db.close()
-    quote_map: dict[str, dict] = {}
-    open_symbols = {
-        leg.get("symbol")
-        for row in rows
-        if row.status == "OPEN"
-        for leg in (json.loads(row.legs_json or "[]") if row.legs_json else [])
-        if leg.get("symbol")
-    }
-    if open_symbols and broker.is_connected():
-        try:
-            quote_map = broker.get_quotes(sorted(open_symbols))
-        except BrokerConnectionError:
-            quote_map = {}
-    return [_coerce_history_entry(row, quote_map) for row in rows]
+    try:
+        _expire_due_positions(db)
+        rows = db.query(PositionHistoryEntry).order_by(PositionHistoryEntry.created_at.desc()).all()
+        return [_coerce_history_entry(row, db) for row in rows]
+    finally:
+        db.close()
 
 
 @app.delete("/manual-monitor/history/{position_id}")
@@ -281,6 +378,7 @@ def delete_manual_history(position_id: str):
         row = db.query(PositionHistoryEntry).filter_by(position_id=position_id).first()
         if row is None:
             raise HTTPException(status_code=404, detail="Trading history record not found")
+        db.query(PositionHistoryLeg).filter_by(position_history_id=row.id).delete(synchronize_session=False)
         db.delete(row)
         db.commit()
         return {"deleted": True, "position_id": position_id}
@@ -374,7 +472,6 @@ def _basket_preview(payload: ManualMonitorSetup) -> dict:
         preview_legs.append(ManualLeg(**(leg.model_dump() | {"entry_price": estimated})))
     by_name = {leg.leg: leg for leg in preview_legs}
     calculations = calculate_position(by_name, {leg.leg: _quote_value(quotes[leg.symbol], "lp") for leg in preview_legs})
-    estimate = calculate_fund_requirement(by_name, mode="LIVE")
     orders = _fyers_basket_orders(preview_legs)
     broker_margin = None
     margin_warning = None
@@ -382,8 +479,16 @@ def _basket_preview(payload: ManualMonitorSetup) -> dict:
         broker_margin = broker.get_basket_margin(orders)
     except BrokerConnectionError as exc:
         margin_warning = str(exc)
+    estimate = calculate_fund_requirement(by_name, mode="LIVE", broker_margin=broker_margin)
     available = broker.get_margin_available()
-    required = float((broker_margin or {}).get("margin_total", estimate["final_estimated_fund_requirement"]))
+    required = estimate["final_funds_required"]
+    if broker_margin is not None and broker_margin.get("margin_total") is None:
+        margin_warning = "FYERS margin response did not contain margin_total"
+    elif broker_margin is not None and (
+        broker_margin.get("gross_margin_requirement") is None or broker_margin.get("hedge_benefit") is None
+    ):
+        margin_warning = "FYERS returned total basket margin without a gross-margin/hedge-benefit breakdown"
+    estimate["margin_warning"] = margin_warning
     return {
         "mode": _normalise_mode(payload.mode), "quote_timestamp": datetime.utcnow().isoformat() + "Z",
         "legs": [leg.model_dump() | {"bid": _quote_value(quotes[leg.symbol], "bid"), "ask": _quote_value(quotes[leg.symbol], "ask"), "ltp": _quote_value(quotes[leg.symbol], "lp")} for leg in preview_legs],
@@ -394,14 +499,15 @@ def _basket_preview(payload: ManualMonitorSetup) -> dict:
             (by_name["PUT SELL"].strike - by_name["PUT BUY"].strike) * by_name["PUT SELL"].quantity - calculations["put_credit"]["total"],
         ),
         "lower_breakeven": calculations["lower_breakeven"], "upper_breakeven": calculations["upper_breakeven"],
-        "estimated_charges": estimate["charges"], "fund_estimate": estimate,
+        "estimated_charges": estimate["estimated_charges"], "fund_estimate": estimate,
         "fyers_margin_required": required, "available_funds": available,
-        "additional_funds_required": max(0.0, required - available),
-        "margin_source": "FYERS_MARGIN_CALCULATOR" if broker_margin else "LOCAL_ESTIMATE",
+        "additional_funds_required": max(0.0, required - available) if required is not None else None,
+        "margin_source": estimate["margin_source"],
         "margin_warning": margin_warning,
         "call_sl": payload.call_sl if payload.call_sl is not None else calculations["call_sl_default"],
         "put_sl": payload.put_sl if payload.put_sl is not None else calculations["put_sl_default"],
-        "alerts": ["Insufficient available funds"] if required > available else [],
+        "alerts": (["FYERS basket margin unavailable"] if required is None
+               else ["Insufficient available funds"] if required > available else []),
         "orders": orders,
     }
 
@@ -421,6 +527,8 @@ def place_live_basket(payload: BasketPlacement):
     if settings.execution_mode != "on":
         raise HTTPException(status_code=403, detail="Live execution is disabled. Set EXECUTION_MODE=on only when ready to trade.")
     preview = _basket_preview(payload)
+    if preview["margin_source"] != "FYERS_MARGIN_CALCULATOR" or preview["fyers_margin_required"] is None:
+        raise HTTPException(status_code=503, detail=preview["margin_warning"] or "FYERS basket margin is unavailable; live order was not placed")
     if preview["additional_funds_required"] > 0:
         raise HTTPException(status_code=409, detail="Insufficient available funds for this basket")
     response = broker.place_basket_orders(preview["orders"])
@@ -430,31 +538,47 @@ def place_live_basket(payload: BasketPlacement):
     return {"placed": True, "basket_response": response, "monitor": saved}
 
 
-def _coerce_history_entry(row: PositionHistoryEntry, quote_map: dict[str, dict] | None = None) -> dict:
-    legs = json.loads(row.legs_json or "[]") if row.legs_json else []
-    quote_map = quote_map or {}
-    marks: dict[str, float | None] = {}
-    for leg in legs:
-        mark = (_quote_value(quote_map.get(leg.get("symbol"), {}), "lp") if row.status == "OPEN"
-                else leg.get("exit_price"))
-        marks[leg.get("leg", "")] = mark
-        leg["current_ltp"] = mark
-        direction = 1 if "BUY" in leg.get("leg", "") else -1
-        leg_pnl = ((mark - leg["entry_price"]) * leg["quantity"] * direction
-                   if mark is not None and leg.get("entry_price") is not None else None)
-        leg["pnl"] = leg_pnl
-        leg["pnl_pct"] = _pnl_percentage(leg_pnl, leg.get("entry_price"), leg.get("quantity"))
-    complete_pnl = all(leg.get("pnl") is not None for leg in legs)
-    calculated_gross_pnl = sum(leg["pnl"] for leg in legs) if complete_pnl else None
-    if row.status != "OPEN" and row.charge_breakdown_json:
-        charge_breakdown = json.loads(row.charge_breakdown_json)
+def _coerce_history_entry(row: PositionHistoryEntry, db: Session) -> dict:
+    stored_legs = db.query(PositionHistoryLeg).filter_by(position_history_id=row.id).all()
+    legs = []
+    for stored_leg in stored_legs:
+        is_exit_captured = stored_leg.exit_price is not None
+        pnl = stored_leg.pnl if is_exit_captured else stored_leg.last_pnl
+        pnl_pct = stored_leg.pnl_pct if is_exit_captured else stored_leg.last_pnl_pct
+        legs.append({
+            "leg": stored_leg.leg,
+            "symbol": stored_leg.symbol,
+            "strike": stored_leg.strike,
+            "quantity": stored_leg.quantity,
+            "entry_price": stored_leg.entry_price,
+            "entry_at": stored_leg.entry_at.isoformat() if stored_leg.entry_at else None,
+            "entry_value": stored_leg.entry_value,
+            "exit_price": stored_leg.exit_price,
+            "exit_at": stored_leg.exit_at.isoformat() if stored_leg.exit_at else None,
+            "exit_value": stored_leg.exit_value,
+            "exit_status": stored_leg.price_status or "NOT_CAPTURED",
+            "last_ltp": stored_leg.last_ltp,
+            "last_ltp_at": stored_leg.last_ltp_at.isoformat() if stored_leg.last_ltp_at else None,
+            "current_ltp": stored_leg.last_ltp if row.status == "OPEN" else None,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "pnl_basis": "EXIT" if is_exit_captured else row.pnl_basis or "NOT_CAPTURED",
+        })
+    if row.charge_breakdown_json:
+        try:
+            charge_breakdown = json.loads(row.charge_breakdown_json)
+        except (TypeError, ValueError):
+            charge_breakdown = {}
     else:
-        charge_legs = {leg.get("leg"): SimpleNamespace(entry_price=leg.get("entry_price"), quantity=leg.get("quantity")) for leg in legs}
-        charge_breakdown = calculate_position_charge_breakdown(charge_legs, marks)
-    total_entry_value = sum((leg.get("entry_price") or 0) * (leg.get("quantity") or 0) for leg in legs)
-    gross_pnl = (row.realized_pnl if row.status != "OPEN" and row.realized_pnl is not None else calculated_gross_pnl)
-    net_pnl = (row.net_pnl if row.status != "OPEN" and row.net_pnl is not None
-               else gross_pnl - sum(charge_breakdown.values()) if gross_pnl is not None else None)
+        charge_legs = {
+            leg.leg: SimpleNamespace(entry_price=leg.entry_price, quantity=leg.quantity)
+            for leg in stored_legs if leg.entry_price is not None and leg.quantity is not None
+        }
+        charge_breakdown = calculate_position_charge_breakdown(charge_legs)
+    total_entry_value = sum((leg.entry_value or 0.0) for leg in stored_legs)
+    net_pnl_percent = row.net_pnl_percent
+    if net_pnl_percent is None and row.net_pnl is not None and total_entry_value:
+        net_pnl_percent = row.net_pnl / total_entry_value * 100
     return {
         "id": row.id,
         "position_id": row.position_id,
@@ -490,12 +614,15 @@ def _coerce_history_entry(row: PositionHistoryEntry, quote_map: dict[str, dict] 
         "opened_at": row.opened_at.isoformat() if row.opened_at else None,
         "closed_at": row.closed_at.isoformat() if row.closed_at else None,
         "realized_pnl": row.realized_pnl,
-        "charges": sum(charge_breakdown.values()),
+        "charges": row.charges if row.charges is not None else sum(charge_breakdown.values()),
         "charge_breakdown": _charge_payload(charge_breakdown),
-        "net_pnl": net_pnl,
-        "net_pnl_pct": _pnl_percentage(net_pnl, total_entry_value, 1),
-        "gross_pnl": gross_pnl,
-        "live_pnl": gross_pnl if row.status == "OPEN" else None,
+        "net_pnl": row.net_pnl,
+        "net_pnl_pct": net_pnl_percent,
+        "gross_pnl": row.realized_pnl if row.status == "OPEN" and row.realized_pnl is not None else row.gross_pnl if row.gross_pnl is not None else row.realized_pnl,
+        "live_pnl": row.realized_pnl if row.status == "OPEN" else None,
+        "pnl_basis": row.pnl_basis,
+        "snapshot_frozen": bool(row.snapshot_frozen),
+        "exit_capture_status": row.exit_capture_status or "NOT_CAPTURED",
         "reason_for_closing": row.reason_for_closing,
         "legs": legs,
     }
@@ -515,6 +642,9 @@ def _persist_manual_position_entry(setup: ManualMonitorSetup, live_ltp_map: dict
     put_credit = calculations["put_credit"]["total"]
     advance = calculate_advance_sl(by_name)
     position_id = f"IC-{setup.mode}-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}-{abs(hash(setup.expiry.isoformat() + ''.join(leg.symbol for leg in setup.legs))) % 100000:05d}"
+    opened_at = datetime.utcnow()
+    initial_charges = calculate_position_charges(by_name, live_ltp_map)
+    total_entry_value = sum(leg.entry_price * leg.quantity for leg in setup.legs)
     db = SessionLocal()
     try:
         row = PositionHistoryEntry(
@@ -544,21 +674,49 @@ def _persist_manual_position_entry(setup: ManualMonitorSetup, live_ltp_map: dict
             put_sl_multiplier=advance["put"]["sl_multiplier"], put_sl_loss=advance["put"]["sl_loss"],
             put_sl_trigger_price=advance["put"]["sl_trigger_price"], put_sl_triggered=0, put_sl_state="ACTIVE",
             entry_nifty_spot=spot,
-            opened_at=datetime.utcnow(),
-            realized_pnl=0.0,
-            charges=calculate_position_charges(by_name),
-            charge_breakdown_json=json.dumps(calculate_position_charge_breakdown(by_name)),
-            net_pnl=-calculate_position_charges(by_name),
+            opened_at=opened_at,
+            realized_pnl=calculations["total_pnl"],
+            gross_pnl=calculations["total_pnl"],
+            charges=initial_charges,
+            charge_breakdown_json=json.dumps(calculate_position_charge_breakdown(by_name, live_ltp_map)),
+            net_pnl=calculations["total_pnl"] - initial_charges,
+            net_pnl_percent=_pnl_percentage(calculations["total_pnl"] - initial_charges, total_entry_value, 1),
+            snapshot_frozen=0,
+            pnl_basis="LAST_MARK",
+            exit_capture_status="NOT_CAPTURED",
             reason_for_closing=None,
             legs_json=json.dumps([
                 {"leg": leg.leg, "symbol": leg.symbol, "strike": leg.strike, "quantity": leg.quantity,
                  "entry_price": leg.entry_price, "requested_entry_price": (requested_entries or {}).get(leg.leg),
                  "simulated_entry_price": simulated[leg.leg] if setup.mode == "PAPER" else None,
-                 "entry_at": datetime.utcnow().isoformat(), "mode": setup.mode}
+                 "entry_at": opened_at.isoformat(), "mode": setup.mode}
                 for leg in setup.legs
             ]),
         )
         db.add(row)
+        db.flush()
+        db.add_all([
+            PositionHistoryLeg(
+                position_history_id=row.id,
+                leg=leg.leg,
+                symbol=leg.symbol,
+                strike=leg.strike,
+                quantity=leg.quantity,
+                entry_price=leg.entry_price,
+                entry_at=opened_at,
+                entry_value=leg.entry_price * leg.quantity,
+                last_ltp=live_ltp_map.get(leg.leg),
+                last_ltp_at=opened_at if live_ltp_map.get(leg.leg) is not None else None,
+                last_pnl=(live_ltp_map[leg.leg] - leg.entry_price) * leg.quantity * (1 if "BUY" in leg.leg else -1)
+                if live_ltp_map.get(leg.leg) is not None else None,
+                last_pnl_pct=_pnl_percentage(
+                    (live_ltp_map[leg.leg] - leg.entry_price) * leg.quantity * (1 if "BUY" in leg.leg else -1),
+                    leg.entry_price, leg.quantity,
+                ) if live_ltp_map.get(leg.leg) is not None else None,
+                price_status="NOT_CAPTURED",
+            )
+            for leg in setup.legs
+        ])
         db.commit()
         db.refresh(row)
         return row.position_id
@@ -574,8 +732,9 @@ def _close_active_history(reason: str, status: str = "STOPPED", final_spot: floa
         row = db.query(PositionHistoryEntry).filter_by(position_id=_manual_active_history_id).first()
         if row is None:
             return None
+        if row.snapshot_frozen or row.status != "OPEN":
+            return _coerce_history_entry(row, db)
         final_ltps: dict[str, float | None] = {}
-        quotes: dict[str, dict] = {}
         if broker.is_connected():
             try:
                 symbols = ["NSE:NIFTY50-INDEX"] + [leg.symbol for leg in _manual_monitor.legs]
@@ -583,40 +742,131 @@ def _close_active_history(reason: str, status: str = "STOPPED", final_spot: floa
                 final_ltps = {leg.leg: _quote_value(quotes.get(leg.symbol, {}), "lp") for leg in _manual_monitor.legs}
                 final_spot = final_spot if final_spot is not None else _quote_value(quotes.get("NSE:NIFTY50-INDEX", {}), "lp")
             except BrokerConnectionError:
-                # Preserve the latest persisted mark if a connection drops at close.
                 final_ltps = {}
-        by_name = {leg.leg: leg for leg in _manual_monitor.legs}
-        complete_ltps = {name: price for name, price in final_ltps.items() if price is not None}
-        calculations = calculate_position(by_name, complete_ltps)
+        history_legs = {leg.leg: leg for leg in db.query(PositionHistoryLeg).filter_by(position_history_id=row.id).all()}
+        now = datetime.utcnow()
+        captured_count = 0
+        for name, leg in history_legs.items():
+            exit_price = final_ltps.get(name)
+            if exit_price is None or leg.exit_price is not None:
+                continue
+            leg.exit_price = float(exit_price)
+            leg.exit_at = now
+            leg.exit_value = float(exit_price) * leg.quantity
+            direction = 1 if "BUY" in name else -1
+            leg.pnl = (float(exit_price) - leg.entry_price) * leg.quantity * direction
+            leg.pnl_pct = _pnl_percentage(leg.pnl, leg.entry_price, leg.quantity)
+            leg.price_status = "CAPTURED"
+            captured_count += 1
         legs = json.loads(row.legs_json or "[]")
-        now = datetime.utcnow().isoformat()
+        exit_times = now.isoformat()
         for leg in legs:
-            exit_price = final_ltps.get(leg.get("leg"))
-            if exit_price is not None:
-                leg["exit_price"] = exit_price
-                leg["exit_at"] = now
+            saved_exit = final_ltps.get(leg.get("leg"))
+            if saved_exit is not None and leg.get("exit_price") is None:
+                leg["exit_price"] = saved_exit
+                leg["exit_at"] = exit_times
         row.legs_json = json.dumps(legs)
         row.status = status
-        row.final_nifty_spot = final_spot if final_spot is not None else row.final_nifty_spot or row.entry_nifty_spot
-        row.closed_at = datetime.utcnow()
+        if final_spot is not None:
+            row.final_nifty_spot = final_spot
+        row.closed_at = now
         row.reason_for_closing = reason
-        row.updated_at = datetime.utcnow()
-        # Closing charges are added only once the final executable prices are
-        # available; open rows show entry charges only.
-        row.charges = calculate_position_charges(by_name, complete_ltps or None)
-        row.charge_breakdown_json = json.dumps(calculate_position_charge_breakdown(by_name, complete_ltps or None))
-        row.realized_pnl = calculations["total_pnl"] if len(complete_ltps) == 4 else row.realized_pnl
-        row.net_pnl = (row.realized_pnl or 0.0) - (row.charges or 0.0)
+        row.updated_at = now
+        row.snapshot_frozen = 1
+        captured_count = sum(leg.exit_price is not None for leg in history_legs.values())
+        row.exit_capture_status = "CAPTURED" if captured_count == 4 else "PARTIAL" if captured_count else "NOT_CAPTURED"
+        if captured_count == 4:
+            row.realized_pnl = sum(leg.pnl for leg in history_legs.values())
+            row.gross_pnl = row.realized_pnl
+            charge_legs = {
+                name: SimpleNamespace(entry_price=leg.entry_price, quantity=leg.quantity)
+                for name, leg in history_legs.items()
+            }
+            exit_prices = {name: leg.exit_price for name, leg in history_legs.items()}
+            row.charges = calculate_position_charges(charge_legs, exit_prices)
+            row.charge_breakdown_json = json.dumps(calculate_position_charge_breakdown(charge_legs, exit_prices))
+            row.net_pnl = row.realized_pnl - row.charges
+            entry_value = sum(leg.entry_value or 0.0 for leg in history_legs.values())
+            row.net_pnl_percent = row.net_pnl / entry_value * 100 if entry_value else None
+            row.pnl_basis = "EXIT_QUOTES"
+        else:
+            row.pnl_basis = row.pnl_basis or ("LAST_MARK" if row.realized_pnl is not None else "NOT_CAPTURED")
         db.commit()
         db.refresh(row)
-        return _coerce_history_entry(row)
+        return _coerce_history_entry(row, db)
     finally:
         db.close()
 
 
+def _frozen_monitor_snapshot(row: PositionHistoryEntry, db: Session) -> dict:
+    history = _coerce_history_entry(row, db)
+    legs = [{
+        "leg": leg["leg"], "strike": leg["strike"], "quantity": leg["quantity"],
+        "entry_price": leg["entry_price"], "ltp": None, "pnl": leg["pnl"], "pnl_pct": leg["pnl_pct"],
+    } for leg in history["legs"]]
+    return {
+        "configured": True,
+        "connection": broker.connection_status(),
+        "expiry": row.expiry,
+        "current_iv": None,
+        "mode": row.mode,
+        "position_status": row.status,
+        "seconds_to_expiry": 0,
+        "legs": legs,
+        "history_id": row.position_id,
+        "alerts": ["Position history is frozen"],
+    }
+
+
+def _persist_complete_history_marks(row: PositionHistoryEntry, db: Session,
+                                    live_ltps: dict[str, float | None], captured_at: datetime | None = None) -> bool:
+    leg_names = {"CALL BUY", "CALL SELL", "PUT SELL", "PUT BUY"}
+    if row.status != "OPEN" or row.snapshot_frozen or any(live_ltps.get(name) is None for name in leg_names):
+        return False
+    saved_legs = {
+        leg.leg: leg
+        for leg in db.query(PositionHistoryLeg).filter_by(position_history_id=row.id).all()
+    }
+    if set(saved_legs) != leg_names:
+        return False
+    captured_at = captured_at or datetime.utcnow()
+    for name, saved_leg in saved_legs.items():
+        price = float(live_ltps[name])
+        direction = 1 if "BUY" in name else -1
+        pnl = (price - saved_leg.entry_price) * saved_leg.quantity * direction
+        saved_leg.last_ltp = price
+        saved_leg.last_ltp_at = captured_at
+        saved_leg.last_pnl = pnl
+        saved_leg.last_pnl_pct = _pnl_percentage(pnl, saved_leg.entry_price, saved_leg.quantity)
+    charge_legs = {
+        name: SimpleNamespace(entry_price=leg.entry_price, quantity=leg.quantity)
+        for name, leg in saved_legs.items()
+    }
+    row.realized_pnl = sum(leg.last_pnl for leg in saved_legs.values())
+    row.gross_pnl = row.realized_pnl
+    row.charges = calculate_position_charges(charge_legs, live_ltps)
+    row.charge_breakdown_json = json.dumps(calculate_position_charge_breakdown(charge_legs, live_ltps))
+    row.net_pnl = row.realized_pnl - row.charges
+    entry_value = sum(leg.entry_value or 0.0 for leg in saved_legs.values())
+    row.net_pnl_percent = row.net_pnl / entry_value * 100 if entry_value else None
+    row.pnl_basis = "LAST_MARK"
+    return True
+
+
 def _manual_snapshot() -> dict:
     if _manual_monitor is None:
-        return {"configured": False, "connection": broker.connection_status()}
+        return {"configured": False, "connection": broker.connection_status(),
+                "current_iv": None,
+                "fund_requirement": {"margin_source": "UNAVAILABLE",
+                                     "margin_warning": "Enter a four-leg position to request basket margin"}}
+    if _manual_active_history_id is not None:
+        db = SessionLocal()
+        try:
+            row = db.query(PositionHistoryEntry).filter_by(position_id=_manual_active_history_id).first()
+            if row is not None and (row.snapshot_frozen or row.status != "OPEN"):
+                return _frozen_monitor_snapshot(row, db)
+        finally:
+            db.close()
     connected = broker.is_connected()
     quotes = {}
     if connected:
@@ -626,6 +876,14 @@ def _manual_snapshot() -> dict:
     spot = _quote_value(spot_quote, "lp")
     spot_change = _quote_value(spot_quote, "ch")
     spot_change_pct = _quote_value(spot_quote, "chp")
+    current_iv = None
+    if connected:
+        try:
+            chain = broker.get_option_chain("NSE:NIFTY50-INDEX", _manual_monitor.expiry.isoformat())
+            current_iv = calculate_current_atm_iv(chain)
+        except Exception as exc:
+            logger.warning("Current ATM IV unavailable: %s", exc)
+            current_iv = None
     by_name = {leg.leg: leg for leg in _manual_monitor.legs}
     live_ltps = {}
     live_legs = []
@@ -653,7 +911,23 @@ def _manual_snapshot() -> dict:
     # simulated fills) are fixed.  Do not re-simulate them on every tick.
     # Entry prices are fixed at setup (paper prices already include one
     # slippage application), so fund calculations must not simulate again.
-    fund_requirement = calculate_fund_requirement(by_name, mode="LIVE")
+    broker_margin = None
+    margin_warning = None
+    if connected:
+        try:
+            broker_margin = broker.get_basket_margin(_fyers_basket_orders(_manual_monitor.legs))
+        except BrokerConnectionError as exc:
+            margin_warning = str(exc)
+    if broker_margin is not None and broker_margin.get("margin_total") is None:
+        margin_warning = "FYERS margin response did not contain margin_total"
+    elif broker_margin is not None and (
+        broker_margin.get("gross_margin_requirement") is None or broker_margin.get("hedge_benefit") is None
+    ):
+        margin_warning = "FYERS returned total basket margin without a gross-margin/hedge-benefit breakdown"
+    elif not connected and margin_warning is None:
+        margin_warning = "FYERS is disconnected; broker basket margin is unavailable"
+    fund_requirement = calculate_fund_requirement(by_name, mode="LIVE", broker_margin=broker_margin)
+    fund_requirement["margin_warning"] = margin_warning
     call_buy, call_sell = by_name["CALL BUY"], by_name["CALL SELL"]
     put_sell, put_buy = by_name["PUT SELL"], by_name["PUT BUY"]
     lower_short, upper_short = put_sell.strike, call_sell.strike
@@ -718,25 +992,21 @@ def _manual_snapshot() -> dict:
         alerts.append("PUT SIDE SL TRIGGERED")
     elif put_state == "APPROACHING_SL":
         alerts.append("PUT SL APPROACHING")
-    expiry_at = datetime.combine(_manual_monitor.expiry, date_time(15, 30))
-    seconds_left = max(0, int((expiry_at - datetime.now()).total_seconds()))
+    expiry_at = _expiry_cutoff_utc(_manual_monitor.expiry)
+    seconds_left = max(0, int((expiry_at - datetime.now(timezone.utc)).total_seconds()))
     if seconds_left == 0:
         alerts.append("Expired position")
     if _manual_active_history_id is not None:
         db = SessionLocal()
         try:
             row = db.query(PositionHistoryEntry).filter_by(position_id=_manual_active_history_id).first()
-            if row is not None:
+            if row is not None and row.status == "OPEN" and not row.snapshot_frozen:
                 row.entry_nifty_spot = row.entry_nifty_spot if row.entry_nifty_spot is not None else spot
-                row.final_nifty_spot = spot
                 row.updated_at = datetime.utcnow()
-                row.charges = total_charges
-                row.charge_breakdown_json = json.dumps(charge_breakdown)
-                row.realized_pnl = gross_pnl
-                row.net_pnl = net_pnl
                 row.mode = _manual_monitor.mode
                 row.call_sl_state = call_state
                 row.put_sl_state = put_state
+                _persist_complete_history_marks(row, db, live_ltps)
                 if call_new_trigger and not row.call_sl_triggered:
                     row.call_sl_triggered = 1
                     row.call_sl_trigger_time = datetime.utcnow()
@@ -752,9 +1022,11 @@ def _manual_snapshot() -> dict:
                 db.commit()
         finally:
             db.close()
+    if seconds_left == 0:
+        _expire_due_positions()
     return {"configured": True, "connection": broker.connection_status() if connected else "DISCONNECTED", "expiry": _manual_monitor.expiry.isoformat(),
-            "spot": spot, "spot_change": spot_change, "spot_change_pct": spot_change_pct,
-            "mode": _manual_monitor.mode, "position_status": "OPEN", "legs": live_legs, "total_pnl": gross_pnl,
+            "spot": spot, "spot_change": spot_change, "spot_change_pct": spot_change_pct, "current_iv": current_iv,
+            "mode": _manual_monitor.mode, "position_status": "EXPIRED" if seconds_left == 0 else "OPEN", "legs": live_legs, "total_pnl": gross_pnl,
             "total_gross_pnl": gross_pnl, "total_charges": total_charges,
             "charges": _charge_payload(charge_breakdown), "net_pnl": net_pnl,
             "net_pnl_pct": _pnl_percentage(net_pnl, total_entry_value, 1),
@@ -777,8 +1049,9 @@ def _manual_snapshot() -> dict:
             "put_sl_triggered": bool(history_row.put_sl_triggered) if history_row else put_new_trigger,
             "alerts": alerts,
             "fund_requirement": fund_requirement,
-            "fund_requirement_market": calculate_fund_requirement(by_name, mode="LIVE"),
-            "fund_requirement_paper": calculate_fund_requirement(by_name, mode="LIVE"),
+            "fund_requirement_market": calculate_fund_requirement(by_name, mode="LIVE", broker_margin=broker_margin),
+            "fund_requirement_paper": calculate_fund_requirement(by_name, mode="LIVE", broker_margin=broker_margin),
+            "fund_margin_warning": margin_warning,
             "paper_slippage_points": _manual_monitor.slippage_points,
             "paper_execution_prices": {leg.leg: calculate_paper_execution_price(leg, quotes.get(leg.symbol), _manual_monitor.slippage_points) for leg in _manual_monitor.legs},
             "history_id": _manual_active_history_id}
@@ -792,7 +1065,7 @@ def manual_monitor(mode: str = "LIVE"):
         _save_manual_mode(mode_key)
         return snapshot
     except BrokerConnectionError as exc:
-        return {"configured": _manual_monitor is not None, "connection": "RECONNECTING", "error": str(exc), "alerts": ["Broker connection lost"]}
+        return {"configured": _manual_monitor is not None, "connection": "RECONNECTING", "current_iv": None, "error": str(exc), "alerts": ["Broker connection lost"]}
 
 
 # ---------------- Raw option chain (for the Option Chain screen) ----------------
