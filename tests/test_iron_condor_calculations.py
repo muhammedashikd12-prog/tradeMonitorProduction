@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import app.main as main_module
 from app.main import ManualLeg, ManualMonitorSetup, _fyers_basket_orders
 from app.models import OptionChainSnapshot, OptionQuote
 from app.services.iron_condor_calculations import (
@@ -10,7 +11,7 @@ from app.services.iron_condor_calculations import (
     calculate_position_charge_breakdown, calculate_position_charges,
     calculate_fund_requirement,
 )
-from app.services.iv_greeks_engine import calculate_current_atm_iv
+from app.services.iv_greeks_engine import calculate_current_atm_iv, normalize_iv_value, iv_freshness_status
 
 
 def _legs():
@@ -174,3 +175,77 @@ class IronCondorCalculationTests(unittest.TestCase):
                     ManualLeg(leg="PUT BUY", symbol="NSE:ABC-PE-1", strike=22150, quantity=65, entry_price=100),
                 ],
             )
+
+    def test_normalize_iv_value_accepts_valid_percentages_and_rejects_bad_data(self):
+        self.assertEqual(normalize_iv_value("18.25"), 18.25)
+        for bad_value in [None, "", "nan", "inf", "-inf", "0", "-2", "1001", "abc", True, float("nan"), float("inf")]:
+            self.assertIsNone(normalize_iv_value(bad_value))
+
+    def test_iv_freshness_tracks_stale_and_missing_timestamps(self):
+        self.assertEqual(iv_freshness_status(None), ("UNKNOWN_TIMESTAMP", None))
+        fresh = datetime.now() - timedelta(seconds=5)
+        status, age = iv_freshness_status(fresh)
+        self.assertEqual(status, "FRESH")
+        self.assertIsNotNone(age)
+        stale = datetime.now() - timedelta(seconds=120)
+        status, _ = iv_freshness_status(stale)
+        self.assertEqual(status, "STALE")
+
+    def test_current_atm_iv_rejects_missing_and_invalid_option_data(self):
+        chain = OptionChainSnapshot(
+            spot=22000,
+            timestamp=datetime.now(),
+            expiry=date.today() + timedelta(days=4),
+            quotes=[
+                OptionQuote(strike=22000, option_type="CE", ltp=0, bid=0, ask=0),
+                OptionQuote(strike=22000, option_type="PE", ltp=0, bid=0, ask=0),
+            ],
+        )
+        self.assertIsNone(calculate_current_atm_iv(chain))
+
+        malformed = OptionChainSnapshot(
+            spot=22000,
+            timestamp=datetime.now(),
+            expiry=date.today() + timedelta(days=4),
+            quotes=[
+                OptionQuote(strike=22000, option_type="CE", ltp=100, bid=99, ask=101, iv="nan"),
+                OptionQuote(strike=22000, option_type="PE", ltp=90, bid=89, ask=91, iv="inf"),
+            ],
+        )
+        self.assertIsNotNone(calculate_current_atm_iv(malformed))
+
+    def test_average_short_iv_requires_both_valid_legs_and_uses_percentage_units(self):
+        call_iv = normalize_iv_value("18.5")
+        put_iv = normalize_iv_value("17.0")
+        average = (call_iv + put_iv) / 2
+        self.assertEqual(call_iv, 18.5)
+        self.assertEqual(put_iv, 17.0)
+        self.assertAlmostEqual(average, 17.75)
+        self.assertGreater(average, 0)
+
+    def test_manual_snapshot_keeps_api_response_compatible_with_iv_status_metadata(self):
+        main_module._manual_monitor = ManualMonitorSetup(
+            expiry=date.today() + timedelta(days=4),
+            base_quantity=1,
+            multiplier=1,
+            legs=[
+                ManualLeg(leg="CALL BUY", symbol="NSE:ABC-CE-1", strike=22000, quantity=1, entry_price=100),
+                ManualLeg(leg="CALL SELL", symbol="NSE:ABC-CE-2", strike=21800, quantity=1, entry_price=10),
+                ManualLeg(leg="PUT SELL", symbol="NSE:ABC-PE-2", strike=21200, quantity=1, entry_price=10),
+                ManualLeg(leg="PUT BUY", symbol="NSE:ABC-PE-1", strike=21000, quantity=1, entry_price=100),
+            ],
+        )
+        main_module._manual_previous_spot = None
+        main_module._manual_previous_iv = None
+        main_module._manual_active_history_id = None
+        with patch.object(main_module.broker, "is_connected", return_value=False):
+            snapshot = main_module._manual_snapshot()
+        self.assertIn("current_iv", snapshot)
+        self.assertIn("current_iv_status", snapshot)
+        self.assertIn("call_iv", snapshot)
+        self.assertIn("put_iv", snapshot)
+        self.assertIn("average_short_iv", snapshot)
+        self.assertIn("current_iv_source", snapshot)
+        self.assertEqual(snapshot["current_iv_status"], "UNAVAILABLE")
+        self.assertIsNone(snapshot["current_iv"])
+        main_module._manual_monitor = None

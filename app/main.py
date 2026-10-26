@@ -29,7 +29,7 @@ from app.services.iron_condor_calculations import (
     calculate_position_charges, calculate_advance_sl, advance_sl_state,
     calculate_position_charge_breakdown,
 )
-from app.services.iv_greeks_engine import calculate_current_atm_iv
+from app.services.iv_greeks_engine import calculate_current_atm_iv, normalize_iv_value, iv_freshness_status
 
 app = FastAPI(title="Condor AI")
 logger = logging.getLogger(__name__)
@@ -853,10 +853,20 @@ def _persist_complete_history_marks(row: PositionHistoryEntry, db: Session,
     return True
 
 
+def _iv_status_for_value(value: float | None, timestamp: datetime | None = None, *, stale_ok: bool = False) -> str:
+    if value is None:
+        return "UNAVAILABLE"
+    if timestamp is None:
+        return "UNKNOWN_TIMESTAMP"
+    status, _ = iv_freshness_status(timestamp, max_age_seconds=settings.iv_data_freshness_seconds)
+    return "STALE" if status == "STALE" and not stale_ok else status
+
+
 def _manual_snapshot() -> dict:
     if _manual_monitor is None:
         return {"configured": False, "connection": broker.connection_status(),
                 "current_iv": None,
+                "current_iv_status": "UNAVAILABLE",
                 "fund_requirement": {"margin_source": "UNAVAILABLE",
                                      "margin_warning": "Enter a four-leg position to request basket margin"}}
     if _manual_active_history_id is not None:
@@ -877,13 +887,18 @@ def _manual_snapshot() -> dict:
     spot_change = _quote_value(spot_quote, "ch")
     spot_change_pct = _quote_value(spot_quote, "chp")
     current_iv = None
+    current_iv_status = "UNAVAILABLE"
+    current_iv_timestamp = None
     if connected:
         try:
             chain = broker.get_option_chain("NSE:NIFTY50-INDEX", _manual_monitor.expiry.isoformat())
+            current_iv_timestamp = chain.timestamp if getattr(chain, "timestamp", None) is not None else None
             current_iv = calculate_current_atm_iv(chain)
+            current_iv_status = _iv_status_for_value(current_iv, current_iv_timestamp)
         except Exception as exc:
             logger.warning("Current ATM IV unavailable: %s", exc)
             current_iv = None
+            current_iv_status = "UNAVAILABLE"
     by_name = {leg.leg: leg for leg in _manual_monitor.legs}
     live_ltps = {}
     live_legs = []
@@ -891,10 +906,14 @@ def _manual_snapshot() -> dict:
         quote = quotes.get(leg.symbol, {})
         ltp = _quote_value(quote, "lp")
         live_ltps[leg.leg] = ltp
+        raw_iv = _quote_value(quote, "iv")
+        normalized_iv = normalize_iv_value(raw_iv)
         live_legs.append(leg.model_dump() | {
             "ltp": ltp, "bid": _quote_value(quote, "bid"), "ask": _quote_value(quote, "ask"),
             "change": _quote_value(quote, "ch"), "volume": _quote_value(quote, "volume"),
-            "oi": _quote_value(quote, "oi"), "iv": _quote_value(quote, "iv"),
+            "oi": _quote_value(quote, "oi"), "iv": normalized_iv,
+            "iv_raw": raw_iv,
+            "iv_status": "UNAVAILABLE" if normalized_iv is None else "UNKNOWN_TIMESTAMP",
         })
     calculations = calculate_position(by_name, live_ltps)
     advance = calculate_advance_sl(by_name)
@@ -934,10 +953,15 @@ def _manual_snapshot() -> dict:
     lower_hedge, upper_hedge = put_buy.strike, call_buy.strike
     call_iv = next((leg["iv"] for leg in live_legs if leg["leg"] == "CALL SELL"), None)
     put_iv = next((leg["iv"] for leg in live_legs if leg["leg"] == "PUT SELL"), None)
+    call_iv_status = next((leg["iv_status"] for leg in live_legs if leg["leg"] == "CALL SELL"), "UNAVAILABLE")
+    put_iv_status = next((leg["iv_status"] for leg in live_legs if leg["leg"] == "PUT SELL"), "UNAVAILABLE")
     short_ivs = [iv for iv in (call_iv, put_iv) if iv is not None]
     global _manual_previous_spot, _manual_previous_iv
     spot_move = None if spot is None or _manual_previous_spot is None else spot - _manual_previous_spot
-    average_iv = sum(short_ivs) / len(short_ivs) if short_ivs else None
+    average_iv = sum(short_ivs) / len(short_ivs) if len(short_ivs) == 2 else None
+    average_iv_status = "UNAVAILABLE" if average_iv is None else "UNKNOWN_TIMESTAMP"
+    if average_iv is not None and call_iv_status == "UNKNOWN_TIMESTAMP" and put_iv_status == "UNKNOWN_TIMESTAMP":
+        average_iv_status = "UNKNOWN_TIMESTAMP"
     iv_change = None if average_iv is None or _manual_previous_iv is None else average_iv - _manual_previous_iv
     _manual_previous_spot = spot
     _manual_previous_iv = average_iv
@@ -1024,8 +1048,15 @@ def _manual_snapshot() -> dict:
             db.close()
     if seconds_left == 0:
         _expire_due_positions()
+    current_iv_freshness_seconds = None
+    current_iv_status_detail = None
+    if current_iv_timestamp is not None:
+        _, current_iv_freshness_seconds = iv_freshness_status(current_iv_timestamp, max_age_seconds=settings.iv_data_freshness_seconds)
+        current_iv_status_detail = current_iv_status
     return {"configured": True, "connection": broker.connection_status() if connected else "DISCONNECTED", "expiry": _manual_monitor.expiry.isoformat(),
             "spot": spot, "spot_change": spot_change, "spot_change_pct": spot_change_pct, "current_iv": current_iv,
+            "current_iv_status": current_iv_status, "current_iv_freshness_seconds": current_iv_freshness_seconds,
+            "current_iv_source": "FYERS_OPTION_CHAIN" if current_iv_timestamp is not None else "UNAVAILABLE",
             "mode": _manual_monitor.mode, "position_status": "EXPIRED" if seconds_left == 0 else "OPEN", "legs": live_legs, "total_pnl": gross_pnl,
             "total_gross_pnl": gross_pnl, "total_charges": total_charges,
             "charges": _charge_payload(charge_breakdown), "net_pnl": net_pnl,
@@ -1040,6 +1071,7 @@ def _manual_snapshot() -> dict:
             "distance_call_short": distance_call, "distance_put_short": distance_put,
             "distance_lower_breakeven": distance_lower_be, "distance_upper_breakeven": distance_upper_be,
             "risk": risk, "call_iv": call_iv, "put_iv": put_iv, "average_short_iv": average_iv,
+            "call_iv_status": call_iv_status, "put_iv_status": put_iv_status, "average_short_iv_status": average_iv_status,
             "iv_change": iv_change, "seconds_to_expiry": seconds_left,
             "call_sl": advance["call"]["sl_loss"], "put_sl": advance["put"]["sl_loss"],
             "sl_multiplier": settings.sl_multiple_of_credit,

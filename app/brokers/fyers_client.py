@@ -37,6 +37,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _response_success(response: Optional[dict]) -> bool:
+    if not isinstance(response, dict):
+        return False
+    return str(response.get("s", "")).lower() == "ok"
+
+
 class FyersClient(BrokerClient):
     def __init__(self, app_id: str, secret_id: str, redirect_uri: str,
                  access_token: str = "", token_file: str = "local/fyers_token.json"):
@@ -83,7 +89,7 @@ class FyersClient(BrokerClient):
             raise BrokerConnectionError("FYERS SDK is not installed")
         self._session.set_token(auth_code)
         response = self._session.generate_token()
-        if response.get("s") != "ok" or not response.get("access_token"):
+        if not _response_success(response) or not response.get("access_token"):
             logger.warning("FYERS authentication failed: token exchange rejected")
             raise BrokerConnectionError("FYERS authentication failed: token exchange rejected")
         self.access_token = str(response["access_token"])
@@ -142,7 +148,7 @@ class FyersClient(BrokerClient):
         logger.warning("FYERS authentication failed: invalid/expired token")
 
     def _handle_response(self, response: dict, operation: str) -> dict:
-        if response.get("s") == "ok":
+        if _response_success(response):
             return response
         if response.get("code") == -15 or "valid token" in str(response.get("message", "")).lower():
             self._invalidate_authentication()
@@ -370,7 +376,7 @@ class FyersClient(BrokerClient):
         if payload.get("code") == -15 or "valid token" in str(payload.get("message", "")).lower():
             self._invalidate_authentication()
             raise BrokerConnectionError("FYERS authentication required. Please reconnect FYERS.")
-        if payload.get("s") != "ok" or not isinstance(payload.get("data"), dict):
+        if not _response_success(payload) or not isinstance(payload.get("data"), dict):
             raise BrokerConnectionError(f"Fyers margin calculator error: {payload.get('message', payload)}")
         data = payload["data"]
         try:
@@ -385,7 +391,7 @@ class FyersClient(BrokerClient):
         """Place an already-reviewed basket. Never call this for paper mode."""
         self._require_connected()
         response = self._fyers.place_basket_orders({"data": orders})
-        if response.get("s") != "ok":
+        if not _response_success(response):
             self._handle_response(response, "basket order")
         return response
 
@@ -446,7 +452,7 @@ class FyersClient(BrokerClient):
             "orderTag": tag or "condor_ai",
         }
         resp = self._fyers.place_order(payload)
-        if resp.get("s") != "ok":
+        if not _response_success(resp):
             self._handle_response(resp, "order")
             return OrderResult(order_id=None, status="REJECTED", raw=resp)
         return OrderResult(order_id=str(resp.get("id")), status="PENDING", raw=resp)
@@ -454,7 +460,7 @@ class FyersClient(BrokerClient):
     def get_order_status(self, order_id: str) -> OrderResult:
         self._require_connected()
         resp = self._fyers.orderbook({"id": order_id})
-        if resp.get("s") != "ok":
+        if not _response_success(resp):
             self._handle_response(resp, "order status")
         if not resp.get("orderBook"):
             return OrderResult(order_id=order_id, status="UNKNOWN", raw=resp)

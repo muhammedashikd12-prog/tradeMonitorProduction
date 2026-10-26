@@ -16,6 +16,39 @@ _N = NormalDist()
 _iv_history: deque[float] = deque(maxlen=252)  # ~1 trading year of daily ATM IVs
 
 
+def normalize_iv_value(value: object) -> Optional[float]:
+    """Return a broker/market IV value in percentage points, or None if invalid."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value or value.lower() in {"nan", "inf", "+inf", "-inf"}:
+            return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    if numeric <= 0 or numeric > 1000:
+        return None
+    return numeric
+
+
+def iv_freshness_status(updated_at: Optional[datetime] = None, *, max_age_seconds: Optional[int] = None) -> tuple[str, Optional[float]]:
+    """Return freshness status for IV data using the actual source timestamp when available."""
+    if updated_at is None:
+        return "UNKNOWN_TIMESTAMP", None
+    max_age = settings.iv_data_freshness_seconds if max_age_seconds is None else max_age_seconds
+    if updated_at.tzinfo is None:
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        updated_at = updated_at.replace(tzinfo=local_tz)
+    else:
+        updated_at = updated_at.astimezone(timezone.utc)
+    age_seconds = max(0.0, (datetime.now(timezone.utc) - updated_at).total_seconds())
+    return ("FRESH" if age_seconds <= max_age else "STALE", age_seconds)
+
+
 def _find_atm_quotes(chain: OptionChainSnapshot):
     strikes = sorted({q.strike for q in chain.quotes})
     atm_strike = min(strikes, key=lambda s: abs(s - chain.spot))
@@ -29,7 +62,9 @@ def black_scholes_iv_estimate(price: float, spot: float, strike: float, t_years:
                                tol: float = 1e-4, max_iter: int = 100) -> Optional[float]:
     """Newton-Raphson implied vol solver, used as a fallback when the broker
     doesn't supply IV directly for a given strike."""
-    if t_years <= 0 or price <= 0:
+    if not math.isfinite(price) or not math.isfinite(spot) or not math.isfinite(strike):
+        return None
+    if t_years <= 0 or price <= 0 or spot <= 0 or strike <= 0:
         return None
     sigma = 0.20
     for _ in range(max_iter):
@@ -68,8 +103,12 @@ def calculate_current_atm_iv(chain: OptionChainSnapshot) -> Optional[float]:
 
     quotes_by_strike = {}
     for quote in chain.quotes:
-        if quote.option_type in ("CE", "PE"):
-            quotes_by_strike.setdefault(quote.strike, {})[quote.option_type] = quote
+        if quote.option_type not in ("CE", "PE"):
+            continue
+        strike = quote.strike
+        if not math.isfinite(strike) or strike <= 0:
+            continue
+        quotes_by_strike.setdefault(strike, {})[quote.option_type] = quote
 
     for strike in sorted(quotes_by_strike, key=lambda value: abs(value - spot)):
         pair = quotes_by_strike[strike]
@@ -81,9 +120,11 @@ def calculate_current_atm_iv(chain: OptionChainSnapshot) -> Optional[float]:
             bid, ask = quote.bid, quote.ask
             if math.isfinite(bid) and math.isfinite(ask) and bid > 0 and ask >= bid:
                 premium = (bid + ask) / 2
-            else:
+            elif math.isfinite(quote.ltp) and quote.ltp > 0:
                 premium = quote.ltp
-            if not math.isfinite(premium) or premium <= 0:
+            else:
+                premium = None
+            if premium is None or not math.isfinite(premium) or premium <= 0:
                 break
             estimate = black_scholes_iv_estimate(premium, spot, strike, t_years, option_type=option_type)
             if estimate is None or not math.isfinite(estimate) or estimate <= 0:
@@ -145,18 +186,18 @@ def compute_iv(chain: OptionChainSnapshot, short_ce_strike: Optional[float] = No
     if not ce or not pe:
         raise ValueError("Could not locate ATM CE/PE quotes in chain")
 
-    atm_ce_iv = ce.iv if ce.iv else 15.0
-    atm_pe_iv = pe.iv if pe.iv else 15.0
+    atm_ce_iv = normalize_iv_value(ce.iv) or 15.0
+    atm_pe_iv = normalize_iv_value(pe.iv) or 15.0
     iv_avg = round((atm_ce_iv + atm_pe_iv) / 2, 2)
     skew = round(atm_ce_iv - atm_pe_iv, 2)
 
     short_ce_iv = short_pe_iv = None
     if short_ce_strike is not None:
         q = next((x for x in chain.quotes if x.strike == short_ce_strike and x.option_type == "CE"), None)
-        short_ce_iv = q.iv if q and q.iv else None
+        short_ce_iv = normalize_iv_value(q.iv) if q else None
     if short_pe_strike is not None:
         q = next((x for x in chain.quotes if x.strike == short_pe_strike and x.option_type == "PE"), None)
-        short_pe_iv = q.iv if q and q.iv else None
+        short_pe_iv = normalize_iv_value(q.iv) if q else None
 
     percentile, rank = compute_iv_percentile_rank(iv_avg)
 

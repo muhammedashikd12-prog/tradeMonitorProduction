@@ -97,6 +97,15 @@ class FyersAuthenticationTests(unittest.TestCase):
                 client.exchange_auth_code("bad-code")
             self.assertFalse(client.token_file.exists())
 
+    def test_uppercase_ok_status_is_accepted(self):
+        FakeSession.token_response = {"s": "OK", "access_token": "uppercase-token"}
+        FakeFyersModel.quote_response = {"s": "OK", "d": [{"v": {"lp": 22000}}]}
+        with patch.object(fyers_client, "fyersModel", FakeFyersSdk):
+            client = self.client()
+            client.exchange_auth_code("auth-code")
+            self.assertTrue(client.verify_connection())
+            self.assertEqual(client.access_token, "uppercase-token")
+
     def test_token_file_survives_client_reload(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(fyers_client, "fyersModel", FakeFyersSdk):
             token_file = str(Path(directory) / "fyers-token.json")

@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     iv_low_max: float = 13.0
     iv_preferred_max: float = 18.0
     iv_high_max: float = 22.0
+    iv_data_freshness_seconds: int = 30
 
     # --- Stop loss / profit booking ---
     sl_multiple_of_credit: float = 3.0   # advance SL loss = max profit x this multiplier
